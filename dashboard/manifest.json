@@ -1,0 +1,13 @@
+{
+  "name": "model-usage-status",
+  "label": "Model Usage Status",
+  "description": "Backend-only provider usage collector for the Hermes Desktop status bar.",
+  "icon": "Pulse",
+  "version": "0.2.0",
+  "tab": {
+    "path": "/model-usage-status",
+    "hidden": true
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
