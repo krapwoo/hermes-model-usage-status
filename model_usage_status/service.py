@@ -39,6 +39,10 @@ class AuthenticationUnavailable(RuntimeError):
     pass
 
 
+class ClaudeAuthenticationRequired(RuntimeError):
+    pass
+
+
 def authentication_status(
     provider: str,
     *,
@@ -183,16 +187,59 @@ def fetch_codex_rate_limits(timeout: int = CODEX_TIMEOUT_SECONDS) -> dict[str, A
             process.wait(timeout=3)
 
 
+def fetch_claude_rate_limits() -> dict[str, Any]:
+    """Read Claude's OAuth usage through Hermes' credential-safe provider adapter."""
+    from agent.account_usage import _fetch_anthropic_account_usage
+    from agent.anthropic_credentials import (
+        is_claude_code_token_valid,
+        read_claude_code_credentials,
+    )
+
+    try:
+        snapshot = _fetch_anthropic_account_usage()
+    except Exception as error:
+        status_code = getattr(getattr(error, "response", None), "status_code", None)
+        if status_code in (401, 403):
+            raise ClaudeAuthenticationRequired("claude_authentication_required") from error
+        raise
+    if snapshot is None:
+        credentials = read_claude_code_credentials()
+        if credentials and not is_claude_code_token_valid(credentials):
+            raise ClaudeAuthenticationRequired("claude_authentication_required")
+        raise RuntimeError("claude_usage_unavailable")
+    if snapshot.unavailable_reason:
+        raise RuntimeError("claude_usage_unavailable")
+
+    window_ids = {
+        "Current session": "five_hour",
+        "Current week": "seven_day",
+    }
+    rate_limits: dict[str, dict[str, float | int | None]] = {}
+    for window in snapshot.windows:
+        window_id = window_ids.get(window.label)
+        if window_id is None or window.used_percent is None:
+            continue
+        rate_limits[window_id] = {
+            "used_percentage": window.used_percent,
+            "resets_at": int(window.reset_at.timestamp()) if window.reset_at else None,
+        }
+    if not rate_limits:
+        raise RuntimeError("claude_usage_unavailable")
+    return {"observation_source": "usage", "rate_limits": rate_limits}
+
+
 class UsageService:
     def __init__(
         self,
         data_dir: Path,
         codex_fetcher: Callable[[], dict[str, Any]] = fetch_codex_rate_limits,
+        claude_fetcher: Callable[[], dict[str, Any]] = fetch_claude_rate_limits,
         now: Callable[[], int] = lambda: int(time.time()),
         auth_checker: Callable[[str], dict[str, Any]] = authentication_status,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.codex_fetcher = codex_fetcher
+        self.claude_fetcher = claude_fetcher
         self.now = now
         self.auth_checker = auth_checker
         self.cache_path = self.data_dir / "usage-cache.json"
@@ -225,16 +272,32 @@ class UsageService:
             if not isinstance(provider, dict):
                 continue
             try:
-                provider["authentication"] = self.auth_checker(provider_id)
+                provider["authentication"] = self._authentication_status(provider_id, provider)
             except Exception:
                 provider["authentication"] = {"state": "unavailable", "action_available": False}
         return snapshot
+
+    def _authentication_status(
+        self,
+        provider_id: str,
+        provider: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if provider_id == "claude":
+            if provider is None:
+                cached = self._read_cache() or {}
+                providers = cached.get("providers")
+                providers = providers if isinstance(providers, dict) else {}
+                candidate = providers.get(provider_id)
+                provider = candidate if isinstance(candidate, dict) else None
+            if provider is not None and provider.get("error_code") == "authentication_required":
+                return {"state": "required", "action_available": True}
+        return self.auth_checker(provider_id)
 
     def launch_reauthentication(self, provider: str) -> dict[str, str]:
         return launch_reauthentication(
             provider,
             data_dir=self.data_dir,
-            status_checker=self.auth_checker,
+            status_checker=self._authentication_status,
         )
 
     def get(self) -> dict[str, Any]:
@@ -286,19 +349,25 @@ class UsageService:
                 if codex.get("id") == "unknown":
                     codex["id"] = "codex"
 
-            observation = read_json(self.claude_path)
-            if observation is not None and isinstance(observation.get("observed_at"), int):
-                claude = normalize_claude_payload(observation, observed_at=observation["observed_at"])
+            try:
+                claude = normalize_claude_payload(self.claude_fetcher(), observed_at=now)
                 claude = merge_refresh_result(previous_providers.get("claude"), claude, now)
-                if claude.get("status") == "current" and now - observation["observed_at"] > CLAUDE_STALE_AFTER_SECONDS:
-                    claude["status"] = "stale"
-                    claude["error_code"] = "observation_stale"
-            else:
-                claude = merge_refresh_result(
-                    previous_providers.get("claude"), None, now, error_code="observation_unavailable"
-                )
-                if claude.get("id") == "unknown":
-                    claude["id"] = "claude"
+            except Exception as error:
+                observation = read_json(self.claude_path)
+                if observation is not None and isinstance(observation.get("observed_at"), int):
+                    claude = normalize_claude_payload(observation, observed_at=observation["observed_at"])
+                    claude = merge_refresh_result(previous_providers.get("claude"), claude, now)
+                    if claude.get("status") == "current" and now - observation["observed_at"] > CLAUDE_STALE_AFTER_SECONDS:
+                        claude["status"] = "stale"
+                        claude["error_code"] = "observation_stale"
+                else:
+                    claude = merge_refresh_result(
+                        previous_providers.get("claude"), None, now, error_code="observation_unavailable"
+                    )
+                    if claude.get("id") == "unknown":
+                        claude["id"] = "claude"
+                if isinstance(error, ClaudeAuthenticationRequired):
+                    claude["error_code"] = "authentication_required"
 
             snapshot = {
                 "schema_version": 1,

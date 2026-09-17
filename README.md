@@ -31,7 +31,7 @@ The installer:
 1. Validates the repository with `hermes plugins validate`.
 2. Installs the unified package at `~/.hermes/plugins/model-usage-status`.
 3. Enables the backend plugin without tool-override permission.
-4. Adds Claude's passive status-line observer while preserving unrelated Claude settings.
+4. Adds Claude's passive status-line observer as a fallback while preserving unrelated Claude settings.
 5. Removes only an obsolete standalone Desktop copy of this same plugin, if present.
 
 Then restart the Hermes backend and reload Hermes Desktop plugins (`⌘K` → **Reload desktop plugins**) or restart Hermes Desktop.
@@ -46,9 +46,9 @@ If Claude already has a different `statusLine`, installation stops without chang
 
 ## Authentication behavior
 
-Each provider popover shows **Reauthenticate Claude** or **Reauthenticate Codex** only when that provider's official CLI reports missing or expired authentication.
+Each provider popover shows **Reauthenticate Claude** or **Reauthenticate Codex** only when that provider's official CLI reports missing or expired authentication, or when Claude's OAuth usage endpoint rejects the saved credentials.
 
-- The button is hidden when authentication is healthy.
+- The button is hidden when authentication is healthy. A Claude OAuth `401`/`403` overrides a false healthy CLI status.
 - Stale quota data or provider rate limiting does not by itself trigger the button.
 - Clicking it asks the backend to open the official `claude auth login` or `codex login` command in Terminal.
 - Credentials, OAuth parameters, codes, and provider output are never returned to the Desktop renderer.
@@ -64,9 +64,9 @@ codex login
 ## Data sources
 
 - **Codex:** structured `account/rateLimits/read` data from `codex app-server`; refreshing does not send a model prompt.
-- **Claude:** documented structured `rate_limits` fields supplied to Claude Code's status-line command after ordinary Claude activity. The plugin does not send a paid prompt merely to update the meter.
+- **Claude:** Claude's OAuth usage endpoint through Hermes' credential-safe provider adapter, with documented structured `rate_limits` status-line fields as a fallback. Refreshing does not send a model prompt.
 
-If Claude has not produced a usable structured observation yet, the plugin shows **Unavailable** rather than inventing a percentage.
+If neither Claude's OAuth usage endpoint nor a passive structured observation is available, the plugin shows **Unavailable** rather than inventing a percentage.
 
 ## Privacy and local files
 
@@ -105,8 +105,8 @@ Uninstalling removes the plugin and its own Claude status-line entry. It intenti
 
 - **Chips do not appear:** reload Desktop plugins from the command palette and confirm the package is under `~/.hermes/plugins/model-usage-status/desktop/plugin.js`.
 - **Popover returns 404:** restart the Hermes backend so `dashboard/plugin_api.py` mounts.
-- **Claude says Unavailable after login:** use Claude Code normally once; login alone does not populate structured quota fields.
-- **Reauthenticate is missing:** it is intentionally hidden unless the official provider CLI reports authentication is required.
+- **Claude says Unavailable after login:** select **Refresh**. If the OAuth usage endpoint is unavailable, use Claude Code normally once to populate the passive fallback.
+- **Reauthenticate is missing:** it is intentionally hidden unless the official provider CLI reports authentication is required or Claude's OAuth usage endpoint rejects the saved credentials.
 - **Installer reports `status_line_conflict`:** Claude already has a different status-line command; the installer will not overwrite it.
 
 ## Development
