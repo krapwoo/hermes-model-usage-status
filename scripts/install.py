@@ -207,7 +207,7 @@ def main() -> int:
     print(f"Plugin {result['status']}: {result['target']}")
     if not args.dry_run:
         print("Restart the Hermes backend, then reload Hermes Desktop plugins.")
-        print("Authenticate Claude and Codex locally if their popovers request it.")
+        print("Authenticate Claude and Codex locally if their status menus request it.")
     return 0
 
 

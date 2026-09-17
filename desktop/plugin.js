@@ -1,9 +1,7 @@
 import {
   cn,
   Codicon,
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
+  DropdownMenuItem,
   queryClient,
   STATUSBAR_AREAS,
   useQuery
@@ -136,7 +134,7 @@ function ProviderDetails({
               })
             ]
           }),
-          jsxs('button', {
+          jsxs(DropdownMenuItem, {
             'aria-label': `Refresh ${name} usage`,
             className: cn(
               'inline-flex items-center gap-1 rounded px-2 py-1 transition-colors',
@@ -144,8 +142,10 @@ function ProviderDetails({
               'disabled:cursor-wait disabled:opacity-60'
             ),
             disabled: refreshing,
-            onClick: onRefresh,
-            type: 'button',
+            onSelect: event => {
+              event.preventDefault()
+              void onRefresh()
+            },
             children: [
               jsx(Codicon, { name: refreshing ? 'loading' : 'refresh', size: '0.75rem' }),
               refreshing ? 'Refreshing' : 'Refresh'
@@ -167,7 +167,7 @@ function ProviderDetails({
                 className: 'text-(--ui-text-secondary)',
                 children: `${name} authentication is required.`
               }),
-              jsx('button', {
+              jsxs(DropdownMenuItem, {
                 'aria-label': `Reauthenticate ${name}`,
                 className: cn(
                   'inline-flex items-center gap-1 rounded border border-(--ui-stroke-secondary) px-2 py-1',
@@ -175,8 +175,10 @@ function ProviderDetails({
                   'disabled:cursor-wait disabled:opacity-60'
                 ),
                 disabled: reauthenticating,
-                onClick: onReauthenticate,
-                type: 'button',
+                onSelect: event => {
+                  event.preventDefault()
+                  void onReauthenticate()
+                },
                 children: reauthenticating ? 'Opening Terminal…' : `Reauthenticate ${name}`
               }),
               reauthenticationMessage
@@ -222,13 +224,19 @@ function ProviderDetails({
   })
 }
 
-function ProviderChip({ providerId }) {
+function ProviderLabel({ providerId }) {
+  const { data, isLoading } = useUsage()
+  const provider = data?.providers?.[providerId]
+
+  return isLoading ? `${providerId === 'claude' ? 'Claude' : 'Codex'} …` : compactLabel(providerId, provider)
+}
+
+function ProviderMenu({ providerId }) {
   const { data, isLoading } = useUsage()
   const [refreshing, setRefreshing] = useState(false)
   const [reauthenticating, setReauthenticating] = useState(false)
   const [reauthenticationMessage, setReauthenticationMessage] = useState(null)
   const provider = data?.providers?.[providerId]
-  const label = isLoading ? `${providerId === 'claude' ? 'Claude' : 'Codex'} …` : compactLabel(providerId, provider)
 
   const refresh = async () => {
     if (refreshing) return
@@ -256,41 +264,29 @@ function ProviderChip({ providerId }) {
     }
   }
 
-  return jsx(Popover, {
-    children: jsxs('div', {
-      className: 'h-full',
-      children: [
-        jsx(PopoverTrigger, {
-          asChild: true,
-          children: jsx('button', {
-            'aria-label': `${label}. Open usage details.`,
-            className: cn(
-              'inline-flex h-full items-center gap-1 rounded-none px-1.5 text-[0.6875rem] tabular-nums transition-colors',
-              'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
-            ),
-            title: `${label} remaining`,
-            type: 'button',
-            children: label
-          })
-        }),
-        jsx(PopoverContent, {
-          align: 'end',
-          className: 'w-auto p-0',
-          side: 'top',
-          children: jsx(ProviderDetails, {
-            generatedAt: data?.generated_at,
-            onReauthenticate: reauthenticate,
-            onRefresh: refresh,
-            provider,
-            providerId,
-            reauthenticating,
-            reauthenticationMessage,
-            refreshing
-          })
-        })
-      ]
-    })
+  return jsx(ProviderDetails, {
+    generatedAt: data?.generated_at,
+    onReauthenticate: reauthenticate,
+    onRefresh: refresh,
+    provider: isLoading ? null : provider,
+    providerId,
+    reauthenticating,
+    reauthenticationMessage,
+    refreshing
   })
+}
+
+function statusItem({ id, providerId, toggleLabel }) {
+  return {
+    id,
+    label: jsx(ProviderLabel, { providerId }),
+    menuAlign: 'end',
+    menuClassName: 'w-auto p-0',
+    menuContent: jsx(ProviderMenu, { providerId }),
+    title: toggleLabel,
+    toggleLabel,
+    variant: 'menu'
+  }
 }
 
 export default {
@@ -303,13 +299,21 @@ export default {
       id: 'claude',
       area: STATUSBAR_AREAS.right,
       order: 128,
-      render: () => jsx(ProviderChip, { providerId: 'claude' })
+      data: statusItem({
+        id: 'model-usage-status:claude',
+        providerId: 'claude',
+        toggleLabel: 'Claude model usage'
+      })
     })
     ctx.register({
       id: 'codex',
       area: STATUSBAR_AREAS.right,
       order: 129,
-      render: () => jsx(ProviderChip, { providerId: 'codex' })
+      data: statusItem({
+        id: 'model-usage-status:codex',
+        providerId: 'codex',
+        toggleLabel: 'Codex model usage'
+      })
     })
   }
 }
