@@ -16,8 +16,10 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 
 from model_usage_status.claude_snapshot import default_output_path, record_observation  # noqa: E402
 from model_usage_status.service import (  # noqa: E402
+    ClaudeAuthenticationRequired,
     UsageService,
     authentication_status,
+    fetch_claude_rate_limits,
     launch_reauthentication,
     parse_codex_response_lines,
 )
@@ -28,6 +30,10 @@ AUTHENTICATED = {"state": "authenticated", "action_available": False}
 
 def authenticated(_provider: str) -> dict:
     return dict(AUTHENTICATED)
+
+
+def unavailable_claude() -> dict:
+    raise RuntimeError("claude_usage_unavailable")
 
 
 def codex_result(used: int = 57) -> dict:
@@ -140,6 +146,25 @@ class ClaudeSnapshotTests(unittest.TestCase):
 
 
 class ProviderAuthenticationTests(unittest.TestCase):
+    def test_oauth_usage_rejection_requires_reauthentication(self) -> None:
+        class UsageRejected(RuntimeError):
+            response = SimpleNamespace(status_code=401)
+
+        error = UsageRejected("provider rejected credentials")
+
+        with patch("agent.account_usage._fetch_anthropic_account_usage", side_effect=error):
+            with self.assertRaises(ClaudeAuthenticationRequired):
+                fetch_claude_rate_limits()
+
+    def test_expired_stored_oauth_without_a_usage_response_requires_reauthentication(self) -> None:
+        with (
+            patch("agent.account_usage._fetch_anthropic_account_usage", return_value=None),
+            patch("agent.anthropic_credentials.read_claude_code_credentials", return_value={"expiresAt": 1}),
+            patch("agent.anthropic_credentials.is_claude_code_token_valid", return_value=False),
+        ):
+            with self.assertRaises(ClaudeAuthenticationRequired):
+                fetch_claude_rate_limits()
+
     def test_successful_status_is_authenticated_without_action(self) -> None:
         result = authentication_status(
             "claude",
@@ -214,6 +239,63 @@ class ProviderAuthenticationTests(unittest.TestCase):
 
 
 class UsageServiceTests(unittest.TestCase):
+    def test_oauth_rejection_overrides_a_false_healthy_cli_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            def rejected() -> dict:
+                raise ClaudeAuthenticationRequired("claude_authentication_required")
+
+            service = UsageService(
+                Path(directory),
+                codex_fetcher=lambda: codex_result(),
+                claude_fetcher=rejected,
+                now=lambda: 1000,
+                auth_checker=authenticated,
+            )
+
+            snapshot = service.refresh()
+
+            claude = snapshot["providers"]["claude"]
+            self.assertEqual(claude["error_code"], "authentication_required")
+            self.assertEqual(
+                claude["authentication"],
+                {"state": "required", "action_available": True},
+            )
+
+            with patch("model_usage_status.service.launch_reauthentication") as launcher:
+                launcher.return_value = {"provider": "claude", "state": "login_started"}
+                service.launch_reauthentication("claude")
+                status_checker = launcher.call_args.kwargs["status_checker"]
+                self.assertEqual(
+                    status_checker("claude"),
+                    {"state": "required", "action_available": True},
+                )
+
+    def test_refresh_uses_live_claude_usage_without_status_line_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = UsageService(
+                Path(directory),
+                codex_fetcher=lambda: codex_result(),
+                claude_fetcher=lambda: {
+                    "observation_source": "usage",
+                    "rate_limits": {
+                        "five_hour": {"used_percentage": 0, "resets_at": 2000},
+                        "seven_day": {"used_percentage": 100, "resets_at": 3000},
+                    },
+                },
+                now=lambda: 1000,
+                auth_checker=authenticated,
+            )
+
+            snapshot = service.refresh()
+
+            claude = snapshot["providers"]["claude"]
+            self.assertEqual(claude["status"], "current")
+            self.assertEqual(claude["source"], "Claude Code /usage")
+            self.assertEqual(
+                [window["remaining_percent"] for window in claude["windows"]],
+                [100.0, 0.0],
+            )
+
     def test_refresh_combines_codex_with_current_claude_observation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
@@ -230,6 +312,7 @@ class UsageServiceTests(unittest.TestCase):
             service = UsageService(
                 data_dir,
                 codex_fetcher=lambda: codex_result(),
+                claude_fetcher=unavailable_claude,
                 now=lambda: 1000,
                 auth_checker=authenticated,
             )
@@ -258,7 +341,12 @@ class UsageServiceTests(unittest.TestCase):
                 }),
                 encoding="utf-8",
             )
-            service = UsageService(data_dir, codex_fetcher=lambda: codex_result(), now=lambda: 1000)
+            service = UsageService(
+                data_dir,
+                codex_fetcher=lambda: codex_result(),
+                claude_fetcher=unavailable_claude,
+                now=lambda: 1000,
+            )
 
             snapshot = service.refresh()
 
@@ -269,7 +357,12 @@ class UsageServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
             now = [1000]
-            service = UsageService(data_dir, codex_fetcher=lambda: codex_result(), now=lambda: now[0])
+            service = UsageService(
+                data_dir,
+                codex_fetcher=lambda: codex_result(),
+                claude_fetcher=unavailable_claude,
+                now=lambda: now[0],
+            )
             first = service.refresh()
             self.assertEqual(first["providers"]["codex"]["status"], "current")
             now[0] = 1100
@@ -294,7 +387,12 @@ class UsageServiceTests(unittest.TestCase):
                 gate.wait(timeout=2)
                 return codex_result()
 
-            service = UsageService(Path(directory), codex_fetcher=fetcher, now=lambda: 1000)
+            service = UsageService(
+                Path(directory),
+                codex_fetcher=fetcher,
+                claude_fetcher=unavailable_claude,
+                now=lambda: 1000,
+            )
             results: list[dict] = []
             threads = [threading.Thread(target=lambda: results.append(service.refresh())) for _ in range(2)]
             for thread in threads:

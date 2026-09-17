@@ -74,6 +74,7 @@ function age(epoch) {
 function errorText(provider) {
   if (provider?.status === 'current') return null
   const messages = {
+    authentication_required: 'Claude rejected the saved authentication. Sign in again to refresh usage.',
     observation_stale: 'Claude has not supplied a newer structured observation yet.',
     observation_unavailable: 'Use Claude Code normally once to populate its provider-native meters.',
     provider_unavailable: 'The provider usage surface could not be refreshed.',
