@@ -14,7 +14,7 @@ The plugin explicitly labels unavailable, stale, expired, and provider-error sta
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) for Claude usage
 - [Codex CLI](https://github.com/openai/codex) for Codex usage
 
-The conditional **Reauthenticate** action currently opens the provider-supported login command in macOS Terminal. Usage display and refresh remain usable without that action on other platforms, but the login launcher is macOS-only in v0.2.0.
+The conditional **Reauthenticate** action currently opens the provider-supported login command in macOS Terminal. Usage display and refresh remain usable without that action on other platforms, but the login launcher is currently macOS-only.
 
 ## Install on a Mac
 
@@ -36,6 +36,8 @@ The installer:
 
 Then restart the Hermes backend and reload Hermes Desktop plugins (`⌘K` → **Reload desktop plugins**) or restart Hermes Desktop.
 
+Right-click the status bar to show or hide **Claude model usage** and **Codex model usage** independently. Selecting either status item opens a menu that stays available while you use **Refresh** or, when required, **Reauthenticate**.
+
 If Claude already has a different `statusLine`, installation stops without changing either the existing plugin or Claude settings. Integrate the commands manually rather than overwriting an existing meter.
 
 ### Validate before installing
@@ -46,13 +48,13 @@ If Claude already has a different `statusLine`, installation stops without chang
 
 ## Authentication behavior
 
-Each provider popover shows **Reauthenticate Claude** or **Reauthenticate Codex** only when that provider's official CLI reports missing or expired authentication, or when Claude's OAuth usage endpoint rejects the saved credentials.
+Each provider menu shows **Reauthenticate Claude** or **Reauthenticate Codex** only when that provider's official CLI reports missing or expired authentication, or when Claude's OAuth usage endpoint rejects the saved credentials.
 
 - The button is hidden when authentication is healthy. A Claude OAuth `401`/`403` overrides a false healthy CLI status.
 - Stale quota data or provider rate limiting does not by itself trigger the button.
 - Clicking it asks the backend to open the official `claude auth login` or `codex login` command in Terminal.
 - Credentials, OAuth parameters, codes, and provider output are never returned to the Desktop renderer.
-- After login completes, select **Refresh** in the popover; the button disappears when the provider reports healthy authentication.
+- After login completes, select **Refresh** in the provider menu; the button disappears when the provider reports healthy authentication.
 
 You can always authenticate directly:
 
@@ -104,7 +106,7 @@ Uninstalling removes the plugin and its own Claude status-line entry. It intenti
 ## Troubleshooting
 
 - **Chips do not appear:** reload Desktop plugins from the command palette and confirm the package is under `~/.hermes/plugins/model-usage-status/desktop/plugin.js`.
-- **Popover returns 404:** restart the Hermes backend so `dashboard/plugin_api.py` mounts.
+- **Provider menu returns 404:** restart the Hermes backend so `dashboard/plugin_api.py` mounts.
 - **Claude says Unavailable after login:** select **Refresh**. If the OAuth usage endpoint is unavailable, use Claude Code normally once to populate the passive fallback.
 - **Reauthenticate is missing:** it is intentionally hidden unless the official provider CLI reports authentication is required or Claude's OAuth usage endpoint rejects the saved credentials.
 - **Installer reports `status_line_conflict`:** Claude already has a different status-line command; the installer will not overwrite it.

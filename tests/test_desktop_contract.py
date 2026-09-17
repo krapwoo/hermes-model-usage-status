@@ -18,6 +18,31 @@ class DesktopPluginContractTests(unittest.TestCase):
         self.assertNotIn("SIDEBAR_NAV_AREA", source)
         self.assertNotIn("area: 'panes'", source)
 
+    def test_status_items_use_host_menu_so_refresh_remains_interactive(self) -> None:
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertNotIn("Popover", source)
+        self.assertEqual(source.count("data: statusItem({"), 2)
+        self.assertIn("variant: 'menu'", source)
+        self.assertIn('menuContent:', source)
+        self.assertIn("menuAlign: 'end'", source)
+
+    def test_status_menu_actions_are_keyboard_navigable_and_stay_open(self) -> None:
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertEqual(source.count('jsxs(DropdownMenuItem'), 2)
+        self.assertEqual(source.count('onSelect: event =>'), 2)
+        self.assertEqual(source.count('event.preventDefault()'), 2)
+        self.assertNotIn("jsxs('button'", source)
+
+    def test_status_items_opt_into_the_status_bar_visibility_menu(self) -> None:
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        self.assertIn("id: 'model-usage-status:claude'", source)
+        self.assertIn("id: 'model-usage-status:codex'", source)
+        self.assertIn("toggleLabel: 'Claude model usage'", source)
+        self.assertIn("toggleLabel: 'Codex model usage'", source)
+
     def test_plugin_uses_only_allowed_import_specifiers(self) -> None:
         source = PLUGIN.read_text(encoding="utf-8")
         specifiers = re.findall(r"from\s+['\"]([^'\"]+)['\"]", source)
