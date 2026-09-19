@@ -165,7 +165,7 @@ Codex example with both a balance and a monthly spend-control limit:
 
 Contract rules:
 
-- `status` is `current`, `off`, or `unavailable`. `freshness` is independently `current` or `stale` for a retained `current`/`off` observation and is `null` when status is `unavailable`.
+- `status` is `current`, `off`, or `unavailable`. It describes credit entitlement and data presence, not observation age. `freshness` independently describes observation age as `current` or `stale` for a retained `current`/`off` observation and is `null` when status is `unavailable`.
 - `unit` governs the entire credit block. `currency` is required only when `unit` is `currency`.
 - Claude currency values use `spend.used_minor` and `spend.limit_minor`; formatting happens in the renderer with `Intl.NumberFormat`.
 - Codex balances use `balance.amount_credits`. Optional monthly-limit amounts use `spend.used_credits` and `spend.limit_credits`. These remain validated decimal strings because the provider contract supplies credit amounts, not a currency.
@@ -216,6 +216,8 @@ Normalize:
 - the optional individual monthly limit to a `spend` object using provider-native credit units;
 - provider-reported spend or explicit credit-backed continuation to `active: true`.
 
+Resolve overlapping Codex signals deterministically. `spendControlReached` controls first and may coexist with a remaining balance. Otherwise, a valid numeric zero balance is exhausted, a valid unlimited balance is unlimited, `hasCredits: false` with no balance is off, and a finite or hidden available balance is current. Contradictory balance signals—such as `hasCredits: false` with a positive balance, or `unlimited: true` with a finite balance—make the credit block malformed rather than inviting a guess. Popover copy follows the same precedence.
+
 `rateLimitResetCredits` is unrelated to monetary credit balance and remains out of scope.
 
 ## Interface behavior
@@ -244,13 +246,13 @@ Credit amounts use text rows only, matching the existing popover. This feature d
 |---|---|---|
 | Balance | `9.5 credits left` | None required |
 | Unlimited | `Unlimited` | None required |
-| Exhausted | `0 credits left · Exhausted` | None required |
+| Balance exhausted | `0 credits left · Exhausted` | None required |
 | Available, hidden balance | `Available` | The provider did not return a balance |
 | Off/no credit entitlement | `Off` | Credit-backed usage is not available |
 | Stale current or off state | Last known current-state copy plus `stale`, or `Off · stale` | Existing observation age remains visible |
 | Unavailable | `Unavailable` | No zero value or inferred balance |
 
-When `individualLimit` is present, show a second text-only `Monthly credit limit` row with the provider's used amount, limit, remaining percentage, and reset time.
+When `individualLimit` is present, show a second text-only `Monthly credit limit` row with the provider's used amount, limit, remaining percentage, and reset time. Reuse the existing allowance percentage formatting in this row; retain the normalized full-precision percentage only for threshold evaluation. If spend control is reached while a balance remains, keep the truthful balance row and mark the monthly-limit row `Reached`; do not rewrite the balance as zero.
 
 ### Compact label algorithm
 
@@ -262,9 +264,9 @@ When `individualLimit` is present, show a second text-only `Monthly credit limit
    - if the percentages tie, weekly;
    - otherwise none.
 3. Format the provider-native credit summary:
-   - Claude: convert integer minor units with the reported currency's standard minor-unit scale, render the exact amount, omit fractional digits for whole values, and otherwise preserve the full native fractional value; never approximate, truncate, or round beyond that exact conversion;
-   - Codex: validated decimal balance followed by `credits left`, or `Unlimited`/`Exhausted`.
-4. When `low` or `exhausted` is true, append `Low` or `Exhausted` to the credit summary for either provider; `Exhausted` takes precedence.
+   - Claude: `Credits <used>/<limit>`; convert integer minor units with the reported currency's standard minor-unit scale, render the exact amount, omit fractional digits for whole values, and otherwise preserve the full native fractional value; never approximate, truncate, or round beyond that exact conversion;
+   - Codex: `<amount> credits left` or `Unlimited`, using the validated decimal balance when present; if no balance summary exists and spend control is reached, use `Monthly limit reached`.
+4. When `low` or `exhausted` is true, append `Low` or `Exhausted` to the credit summary for either provider; `Exhausted` takes precedence. When a Codex qualifier derives from `spend` while the summary shows `balance`, use `Monthly limit low` or `Monthly limit reached` so the qualifier names the controlling value. Do not repeat a qualifier already present in the base summary.
 5. Render provider name, optional selected allowance, and credit summary.
 6. Append `stale` when the consequential credit value is bounded-stale.
 7. Never include unavailable credit data in the compact label.
@@ -281,7 +283,7 @@ When `individualLimit` is present, show a second text-only `Monthly credit limit
 
 1. The renderer requests the existing combined usage snapshot.
 2. `UsageService.get()` returns a cache younger than five minutes or calls `refresh()`.
-3. `refresh()` allows one service-level owner covering both provider reads. Concurrent automatic callers share that owner. A manual request records `requested_at`: it accepts the owner's result only if the owner started at or after that time; otherwise manual requests coalesce into exactly one follow-up read after the owner completes.
+3. `refresh()` allows one service-level owner covering both provider reads. Concurrent automatic callers share that owner. A manual request records `requested_at`: it accepts the owner's result only if the owner started at or after that time; otherwise manual requests coalesce into exactly one follow-up read after the owner completes. Both `requested_at` and `owner.started_at` use one in-process monotonic clock, so wall-clock adjustment cannot let an older owner satisfy a later manual request.
 4. Claude and Codex refresh independently.
 5. Each provider result normalizes allowance and credit data at its provider boundary.
 6. The service merges successes and bounded stale data without letting one provider failure erase the other provider.
@@ -397,7 +399,7 @@ Evidence gaps to close during implementation:
 Cover:
 
 - Claude enabled, off, zero spend, active, low, exhausted, exhausted-at-0%-with-Low-suppressed, missing cap, invalid currency, and malformed values;
-- Codex finite balance, zero, unlimited, `hasCredits: false`, `hasCredits: true` with hidden balance, individual monthly limit, spend-control reached, and absent data;
+- Codex finite balance, zero, unlimited, `hasCredits: false`, `hasCredits: true` with hidden balance, individual monthly limit, spend-control reached with and without a remaining balance, overlapping-signal precedence, contradictory-signal rejection, and absent data;
 - provider-specific unit conversion and exact decimal preservation;
 - invalid cross-unit fields and spend-only `remaining_percent` scoping;
 - rejection of booleans, NaN, infinity, negatives, and ambiguous strings;
@@ -430,6 +432,7 @@ Cover:
 - lowest-remaining allowance selection when no account allowance is exhausted;
 - at-most-two-facts compact label rule;
 - provider-native Claude currency and Codex credit-unit formatting;
+- Codex `Monthly limit low`/`Monthly limit reached` qualifier provenance and existing allowance percentage formatting;
 - textual Low/Exhausted precedence without color dependence;
 - existing keyboard-operable Refresh and Reauthenticate controls;
 - incremented query contract version.
