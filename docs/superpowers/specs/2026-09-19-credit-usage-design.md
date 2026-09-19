@@ -93,6 +93,13 @@ If the weekly allowance is exhausted, healthy 5-hour headroom is omitted because
 
 Credit data has its own observation time and freshness state. A failed refresh must preserve any last successful credit state, including `Off` and enabled zero-spend states, as visibly `stale` in the popover for at most 15 minutes. Non-consequential states remain absent from the compact label. After 15 minutes, the popover shows `Unavailable` and any credit amount leaves the compact label.
 
+### CREDIT-ACQUISITION-001 — Keep Claude OAuth material server-side
+
+- The plugin backend makes one OAuth usage request using Hermes's existing Claude credential resolver so the same response supplies allowance windows and structured `extra_usage` fields.
+- The resolved token exists only in memory for that request. It is never logged, persisted, cached, or returned to the Desktop renderer.
+- The raw provider response is normalized immediately and discarded; only the sanitized provider snapshot is persisted.
+- Do not parse the shared account-usage adapter's formatted `details` text. That representation omits the `Off` state, can default an absent currency, and does not preserve the structured minor-unit scale required by this design.
+
 ## Architecture
 
 ### Existing surfaces retained
@@ -116,6 +123,7 @@ Claude example:
     "freshness": "current",
     "unit": "currency",
     "currency": "USD",
+    "minor_unit_scale": 2,
     "balance": null,
     "spend": {
       "used_minor": 1840,
@@ -142,6 +150,7 @@ Codex example with both a balance and a monthly spend-control limit:
     "freshness": "current",
     "unit": "credits",
     "currency": null,
+    "minor_unit_scale": null,
     "balance": {
       "available": true,
       "amount_credits": "9.5",
@@ -166,8 +175,8 @@ Codex example with both a balance and a monthly spend-control limit:
 Contract rules:
 
 - `status` is `current`, `off`, or `unavailable`. It describes credit entitlement and data presence, not observation age. `freshness` independently describes observation age as `current` or `stale` for a retained `current`/`off` observation and is `null` when status is `unavailable`.
-- `unit` governs the entire credit block. `currency` is required only when `unit` is `currency`.
-- Claude currency values use `spend.used_minor` and `spend.limit_minor`; formatting happens in the renderer with `Intl.NumberFormat`.
+- `unit` governs the entire credit block. `currency` and `minor_unit_scale` are required only when an enabled `currency` block contains monetary amounts. Currency is exactly three uppercase ASCII letters. The scale is a provider-reported integer from 0 through 6; never infer it from the currency code.
+- Claude currency values use `spend.used_minor` and `spend.limit_minor`. Accept non-negative integers or integral finite floats only, preserve them as integers, and format them in the renderer with `Intl.NumberFormat` configured to the explicit `minor_unit_scale`.
 - Codex balances use `balance.amount_credits`. Optional monthly-limit amounts use `spend.used_credits` and `spend.limit_credits`. These remain validated decimal strings because the provider contract supplies credit amounts, not a currency.
 - `balance.available: true` with `amount_credits: null` means the provider confirmed credit availability but withheld the amount; it is current, non-consequential, and popover-only.
 - `*_minor` fields are invalid when `unit` is `credits`; `*_credits` fields are invalid when `unit` is `currency`. A violation invalidates only the credit block.
@@ -183,13 +192,14 @@ Contract rules:
 
 ### Claude acquisition and normalization
 
-One credential-safe OAuth usage read captures both allowance windows and `extra_usage`.
+One plugin-backend OAuth usage read captures both allowance windows and `extra_usage`. Resolve the OAuth token through Hermes's existing credential resolver, use it only in the request authorization header, normalize the response at the provider boundary, and discard both token and raw response before returning. The renderer and persisted cache receive only sanitized fields from the normalized contract.
 
 Normalize:
 
 - `is_enabled: false` to `status: off`;
 - valid enabled spend and cap to a currency `spend` object;
 - provider currency plus minor-unit spend and cap without guessing scale;
+- provider `decimal_places` to `minor_unit_scale`, rejecting absent, boolean, fractional, negative, or greater-than-six scales for enabled monetary amounts;
 - spend greater than zero to `active: true`;
 - zero cap remaining to `exhausted: true`;
 - a valid remaining ratio of 20% or less to `low: true`.
@@ -399,6 +409,7 @@ Evidence gaps to close during implementation:
 Cover:
 
 - Claude enabled, off, zero spend, active, low, exhausted, exhausted-at-0%-with-Low-suppressed, missing cap, invalid currency, and malformed values;
+- Claude minor-unit scales 0, 2, and 3; integral-float minor amounts; and missing, boolean, fractional, negative, or oversized scales;
 - Codex finite balance, zero, unlimited, `hasCredits: false`, `hasCredits: true` with hidden balance, individual monthly limit, spend-control reached with and without a remaining balance, overlapping-signal precedence, contradictory-signal rejection, and absent data;
 - provider-specific unit conversion and exact decimal preservation;
 - invalid cross-unit fields and spend-only `remaining_percent` scoping;
@@ -410,6 +421,7 @@ Cover:
 Cover:
 
 - current allowances with unavailable credits;
+- a single Claude OAuth response supplying both windows and credits without persisting or returning token/raw-response material;
 - current credits with provider-specific source and observation time;
 - transient failure to bounded stale state;
 - failure and expiry from non-consequential `Off` and enabled-zero states;
