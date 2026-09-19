@@ -9,7 +9,7 @@
 
 Improve the existing Hermes Desktop status-bar plugin so users can see provider-native credit usage alongside allowance windows without confusing credits with local token cost estimates.
 
-The two existing provider popovers always show a Credits section. The compact status-bar label remains allowance-focused until credits become consequential. Once credit spending is active, low, exhausted, or temporarily stale after prior activity, the label shows the controlling exhausted allowance when known plus the provider-native credit summary.
+The two existing provider popovers always show a Credits section. The compact status-bar label remains allowance-only until credits become consequential. Once credit spending is active, low, exhausted, or temporarily stale after prior activity, the label shows one account allowance plus the provider-native credit summary: the controlling exhausted allowance when one exists, otherwise the current account allowance with the lowest remaining percentage.
 
 Claude reports monetary extra usage as spend against a monthly cap and includes a currency. Codex reports a provider-native credit balance without a currency. The plugin must preserve those semantics instead of forcing both providers into dollars.
 
@@ -65,31 +65,33 @@ This design extends those mechanisms. It does not create a parallel credits plug
 - Claude uses its reported currency and presents extra-usage spend against a monthly cap.
 - Codex presents its numeric balance as `credits` because the app-server contract does not report a currency and Codex's own status UI uses credit units.
 - Missing currency or amount data must not be repaired with a guessed dollar symbol.
+- A balance-only Codex snapshot cannot truthfully report `low` because it has no denominator. The UI must not infer a threshold from local history; it moves directly from available balance to explicit exhaustion unless a provider spend limit supplies a denominator.
 
 ### CREDIT-PLACEMENT-001 — Always in the popover; conditional in the label
 
 - Every provider popover contains a Credits section.
 - The status-bar label includes credits only when credit use is active, low, exhausted, or stale after previously confirmed activity.
 
-### CREDIT-LABEL-001 — Show the controlling exhausted allowance
+### CREDIT-LABEL-001 — Preserve one account allowance beside credits
 
 When credits are consequential, the compact label contains at most two facts:
 
-1. the controlling exhausted account allowance, if one is identifiable; and
+1. one account allowance: the controlling exhausted allowance when one exists, otherwise the current short or weekly account window with the lowest remaining percentage; and
 2. the provider-native credit summary.
 
 Examples:
 
-- `Claude 5h 0% · Credits $18/$100`
-- `Claude Week 0% · Credits $18/$100`
+- `Claude 5h 0% · Credits $18.40/$100`
+- `Claude Week 0% · Credits $18.40/$100`
 - `Codex Week 0% · 9.5 credits left`
-- `Claude Credits $18/$100` when no controlling account allowance is identifiable
+- `Claude 5h 42% · Credits $18.40/$100` when no account allowance is exhausted and the 5-hour window has the lowest remaining percentage
+- `Claude Credits $18.40/$100` only when no current account allowance is identifiable
 
-If the weekly allowance is exhausted, healthy 5-hour headroom is omitted because it cannot restore included access. If both account windows are exhausted, the weekly exhaustion is the controlling constraint. Model-specific windows remain available in the popover and do not expand the compact label beyond two facts.
+If the weekly allowance is exhausted, healthy 5-hour headroom is omitted because it cannot restore included access. If both account windows are exhausted, the weekly exhaustion is the controlling constraint. If neither is exhausted, compare valid current short and weekly percentages and choose the lower one; a tie chooses weekly because it is the longer-lived constraint. Model-specific windows remain available in the popover and do not expand the compact label beyond two facts. `Low`, `Exhausted`, and `stale` qualify the credit fact rather than count as additional facts.
 
-### CREDIT-FRESHNESS-001 — Bound monetary staleness
+### CREDIT-FRESHNESS-001 — Bound credit staleness
 
-Credit data has its own observation time and freshness state. A failed refresh may preserve the last successful consequential credit value as `stale` for at most 15 minutes. After that, the popover shows `Unavailable` and the monetary or credit amount leaves the compact label.
+Credit data has its own observation time and freshness state. A failed refresh must preserve any last successful credit state, including `Off` and enabled zero-spend states, as visibly `stale` in the popover for at most 15 minutes. Non-consequential states remain absent from the compact label. After 15 minutes, the popover shows `Unavailable` and any credit amount leaves the compact label.
 
 ## Architecture
 
@@ -105,21 +107,19 @@ Credit data has its own observation time and freshness state. A failed refresh m
 
 Each provider object gains a nullable `credits` object. Increment both the persisted snapshot schema and the renderer query-contract version. A schema-v1 allowance-only cache must trigger a refresh rather than appear to contain complete credit data.
 
+Claude example:
+
 ```json
 {
   "credits": {
-    "status": "current | stale | off | unavailable",
-    "unit": "currency | credits",
-    "currency": "USD or null",
-    "balance": {
-      "amount_credits": "9.5",
-      "unlimited": false
-    },
+    "status": "current",
+    "freshness": "current",
+    "unit": "currency",
+    "currency": "USD",
+    "balance": null,
     "spend": {
       "used_minor": 1840,
       "limit_minor": 10000,
-      "used_credits": null,
-      "limit_credits": null,
       "remaining_percent": 81.6,
       "resets_at": 1792800000
     },
@@ -127,7 +127,37 @@ Each provider object gains a nullable `credits` object. Increment both the persi
     "low": false,
     "exhausted": false,
     "observed_at": 1790200000,
-    "source": "provider-owned source label or null",
+    "source": "claude-oauth-usage",
+    "error_code": null
+  }
+}
+```
+
+Codex example with both a balance and a monthly spend-control limit:
+
+```json
+{
+  "credits": {
+    "status": "current",
+    "freshness": "current",
+    "unit": "credits",
+    "currency": null,
+    "balance": {
+      "available": true,
+      "amount_credits": "9.5",
+      "unlimited": false
+    },
+    "spend": {
+      "used_credits": "2.5",
+      "limit_credits": "12.0",
+      "remaining_percent": 79.1666666667,
+      "resets_at": 1792800000
+    },
+    "active": true,
+    "low": false,
+    "exhausted": false,
+    "observed_at": 1790200000,
+    "source": "codex-app-server",
     "error_code": null
   }
 }
@@ -135,15 +165,21 @@ Each provider object gains a nullable `credits` object. Increment both the persi
 
 Contract rules:
 
-- `currency` is required only when `unit` is `currency`.
+- `status` is `current`, `off`, or `unavailable`. `freshness` is independently `current` or `stale` for a retained `current`/`off` observation and is `null` when status is `unavailable`.
+- `unit` governs the entire credit block. `currency` is required only when `unit` is `currency`.
 - Claude currency values use `spend.used_minor` and `spend.limit_minor`; formatting happens in the renderer with `Intl.NumberFormat`.
 - Codex balances use `balance.amount_credits`. Optional monthly-limit amounts use `spend.used_credits` and `spend.limit_credits`. These remain validated decimal strings because the provider contract supplies credit amounts, not a currency.
+- `balance.available: true` with `amount_credits: null` means the provider confirmed credit availability but withheld the amount; it is current, non-consequential, and popover-only.
+- `*_minor` fields are invalid when `unit` is `credits`; `*_credits` fields are invalid when `unit` is `currency`. A violation invalidates only the credit block.
 - A provider may supply both `balance` and `spend`; this is required for Codex accounts that expose a remaining balance and a monthly spend-control limit in the same snapshot.
-- `spend.remaining_percent` exists only when the provider supplies a valid denominator or authoritative remaining percentage.
+- `spend.remaining_percent` always describes the `spend` subobject, never `balance`, and exists only when the provider supplies a valid denominator or authoritative remaining percentage.
 - `low` means 20% or less remains and is false when no denominator exists.
 - `exhausted` requires an explicit provider zero or reached-spend-control signal.
+- When `exhausted` and `low` are both true, `Exhausted` suppresses `Low` in all rendered copy; the normalized `low` flag may remain true.
 - `active` must come from reported spend or an explicit provider condition proving credit-backed continuation. Local balance history and token activity are not evidence of active spending.
 - Invalid, negative, non-finite, boolean, or ambiguous values invalidate only the affected credit block.
+- `observed_at` is stamped locally in UTC epoch seconds when the provider response is received. Age is computed against the same wall clock; a negative age or an age over the applicable bound is expired, never current.
+- Permitted `source` values are `claude-oauth-usage`, `codex-app-server`, or `null` before any successful credit observation. Permitted `error_code` values are `auth_rejected`, `timeout`, `rate_limited`, `malformed`, `unsupported`, or `null`. Neither field is rendered verbatim to the user.
 
 ### Claude acquisition and normalization
 
@@ -158,7 +194,7 @@ Normalize:
 - zero cap remaining to `exhausted: true`;
 - a valid remaining ratio of 20% or less to `low: true`.
 
-The passive Claude status-line observation can recover allowance windows only. It does not contain `extra_usage`; therefore it cannot make credits current. A prior current credit value may remain stale within the 15-minute bound, otherwise credits become unavailable.
+The passive Claude status-line observation can recover allowance windows only. It does not contain `extra_usage`; therefore it cannot make credits current. A prior current or off credit state must remain visibly stale within the 15-minute bound, otherwise credits become unavailable.
 
 ### Codex acquisition and normalization
 
@@ -174,6 +210,8 @@ Normalize:
 
 - `unlimited: true` to `balance.unlimited: true`;
 - `hasCredits: true` plus a valid balance to `balance.amount_credits`;
+- `hasCredits: false` with no balance to `status: off`, never `exhausted`;
+- `hasCredits: true` with no returned balance to `status: current`, `balance.available: true`, and `balance.amount_credits: null`, with `active`, `low`, and `exhausted` all false;
 - explicit zero balance or reached spend control to `exhausted: true`;
 - the optional individual monthly limit to a `spend` object using provider-native credit units;
 - provider-reported spend or explicit credit-backed continuation to `active: true`.
@@ -195,10 +233,10 @@ Place the Credits section after allowance and model-limit rows and before the pr
 | Low | `$85 of $100 used · Low` | `$15 remains this month` |
 | Exhausted | `$100 of $100 used · Exhausted` | `$0 remains this month` |
 | Off | `Off` | `Paid extra usage is not enabled.` |
-| Stale | Last known amount plus `stale` | Existing observation age remains visible |
+| Stale current or off state | Last known current-state copy plus `stale`, or `Off · stale` | Existing observation age remains visible |
 | Unavailable | `Unavailable` | No zero value or inferred balance |
 
-A valid spend-and-cap state includes a progress indicator based on amount used.
+Credit amounts use text rows only, matching the existing popover. This feature does not introduce a progress component.
 
 #### Codex
 
@@ -209,29 +247,31 @@ A valid spend-and-cap state includes a progress indicator based on amount used.
 | Exhausted | `0 credits left · Exhausted` | None required |
 | Available, hidden balance | `Available` | The provider did not return a balance |
 | Off/no credit entitlement | `Off` | Credit-backed usage is not available |
-| Stale | Last known amount plus `stale` | Existing observation age remains visible |
+| Stale current or off state | Last known current-state copy plus `stale`, or `Off · stale` | Existing observation age remains visible |
 | Unavailable | `Unavailable` | No zero value or inferred balance |
 
-When `individualLimit` is present, show a second `Monthly credit limit` row with the provider's used amount, limit, remaining percentage, and reset time.
+When `individualLimit` is present, show a second text-only `Monthly credit limit` row with the provider's used amount, limit, remaining percentage, and reset time.
 
 ### Compact label algorithm
 
 1. If credits are not active, low, exhausted, or bounded-stale after prior activity, use the current allowance-only label unchanged.
-2. Find the controlling exhausted account allowance:
+2. Select one account allowance:
    - weekly if the weekly account window is exhausted;
    - otherwise the exhausted short account window;
+   - otherwise the current short or weekly account window with the lowest valid remaining percentage;
+   - if the percentages tie, weekly;
    - otherwise none.
 3. Format the provider-native credit summary:
-   - Claude: localized spent/cap currency, compacted without false precision;
+   - Claude: convert integer minor units with the reported currency's standard minor-unit scale, render the exact amount, omit fractional digits for whole values, and otherwise preserve the full native fractional value; never approximate, truncate, or round beyond that exact conversion;
    - Codex: validated decimal balance followed by `credits left`, or `Unlimited`/`Exhausted`.
-4. Render provider name, optional controlling allowance, and credit summary.
-5. Append `stale` when the consequential credit value is bounded-stale.
-6. Never include unavailable credit data in the compact label.
+4. When `low` or `exhausted` is true, append `Low` or `Exhausted` to the credit summary for either provider; `Exhausted` takes precedence.
+5. Render provider name, optional selected allowance, and credit summary.
+6. Append `stale` when the consequential credit value is bounded-stale.
+7. Never include unavailable credit data in the compact label.
 
 ### Accessibility and responsive behavior
 
 - Reuse the host's existing keyboard-operable menu items and focus behavior.
-- Give each progress indicator a programmatic label and numeric value/limit semantics.
 - Include textual `Low`, `Exhausted`, `Off`, `Unavailable`, and `stale` labels; color is supplementary only.
 - Preserve the existing popover width and token-based spacing, typography, borders, and colors.
 - Keep the compact label to at most two facts so it remains usable at constrained status-bar widths.
@@ -241,7 +281,7 @@ When `individualLimit` is present, show a second `Monthly credit limit` row with
 
 1. The renderer requests the existing combined usage snapshot.
 2. `UsageService.get()` returns a cache younger than five minutes or calls `refresh()`.
-3. `refresh()` allows one owner; concurrent callers wait for that owner rather than launching duplicate provider reads.
+3. `refresh()` allows one service-level owner covering both provider reads. Concurrent automatic callers share that owner. A manual request records `requested_at`: it accepts the owner's result only if the owner started at or after that time; otherwise manual requests coalesce into exactly one follow-up read after the owner completes.
 4. Claude and Codex refresh independently.
 5. Each provider result normalizes allowance and credit data at its provider boundary.
 6. The service merges successes and bounded stale data without letting one provider failure erase the other provider.
@@ -253,14 +293,15 @@ When `individualLimit` is present, show a second `Monthly credit limit` row with
 | Condition | Required behavior |
 |---|---|
 | Authentication rejected | Preserve provider-specific reauthentication; credits are unavailable until a successful read |
-| Timeout, 429, or transient provider failure | Preserve a last-known consequential credit value as visibly stale for at most 15 minutes |
+| Timeout, 429, or transient provider failure | Preserve any last-known credit state as visibly stale in the popover for at most 15 minutes; only previously consequential values remain eligible for the compact label |
 | Stale bound expires | Replace the amount with `Unavailable` in the popover and remove it from the compact label |
 | Malformed credit block | Reject only that block; retain valid allowance data |
 | Partial provider response | Render valid fields and mark the missing credit portion unavailable |
 | Manual refresh fails | Keep the menu open, restore the Refresh control, and retain safe prior state |
 | Passive Claude fallback succeeds | Refresh allowance windows only; credit freshness remains independent |
 | Later provider recovery | Replace stale/unavailable credit state atomically without a plugin reload |
-| Concurrent refresh request | Wait for the existing owner; do not create live overlap |
+| Concurrent automatic refresh request | Wait for the existing owner; do not create live overlap |
+| Manual refresh starts during an older in-flight read | Queue exactly one follow-up read after the owner completes; coalesce duplicate manual requests |
 
 Refresh is short, read-only, and serialized. It does not need a user-facing cancellation control.
 
@@ -271,6 +312,7 @@ Refresh is short, read-only, and serialized. It does not need a user-facing canc
 - **Outcome:** Show trustworthy allowance and credit state through initial load, refresh, partial provider recovery, bounded staleness, and authentication interruption.
 - **Non-goals:** Payment actions, historical spend, account switching, reset-credit redemption, or new refresh controls.
 - **Mode:** `single_flow`
+- **State-machine scope:** S1–S4 and S6–S8 are instantiated independently per provider status item. S5 is one service-level refresh owner covering both provider reads. Mixed states are valid—for example, Claude may be S8 while Codex remains S2—and one provider's failure never changes the other provider's state.
 
 ### Journey and surfaces
 
@@ -286,26 +328,26 @@ Refresh is short, read-only, and serialized. It does not need a user-facing canc
 | S3 | Current low credits | Service and renderer | Valid denominator reports 20% or less remaining | Current values and observation time | REQ-LABEL-2, REQ-STATE-1 |
 | S4 | Current exhausted credits | Service and renderer | Explicit zero or reached-spend-control signal | Current values and observation time | REQ-LABEL-2, REQ-STATE-2 |
 | S5 | Refreshing | `UsageService` owner and renderer control state | Automatic expiry or manual Refresh | Last safe sanitized snapshot | REQ-FLOW-1 |
-| S6 | Bounded-stale consequential credits | Service and renderer | Refresh fails and prior consequential data is at most 15 minutes old | Last successful amount and observation time | REQ-FRESH-1 |
-| S7 | Credits unavailable | Service and renderer | No valid data, malformed data, or stale bound expired | Valid allowance windows | REQ-FRESH-2, REQ-ERROR-1 |
+| S6 | Bounded-stale credit state | Service and renderer | Refresh fails and any prior credit observation is at most 15 minutes old | Last successful current/off state and observation time | REQ-FRESH-1 |
+| S7 | Credits unavailable | Service and renderer | No valid data, malformed data, stale bound expired, cold start, or legacy allowance-only cache | Valid allowance windows where present | REQ-FRESH-2, REQ-ERROR-1 |
 | S8 | Authentication required | Provider authentication state | Provider rejects saved credentials | Safe allowance/cache data where valid | REQ-AUTH-1 |
 
 ### Transitions
 
 | Transition ID | From | To | Initiated by | Completed by | Guards | Effects | Requirement IDs |
 |---|---|---|---|---|---|---|---|
-| T1 | S1/S2/S3/S4/S6/S7 | S5 | Timer or user | `UsageService` | No refresh owner exists; otherwise caller waits | Disable Refresh and begin one provider read | REQ-FLOW-1 |
+| T1 | S1/S2/S3/S4/S6/S7 | S5 | Timer or user | `UsageService` | Cold/legacy cache enters immediately; automatic callers share an owner; a manual caller accepts that owner only if `owner.started_at >= requested_at`, otherwise it queues one coalesced follow-up | Disable Refresh and begin one combined refresh with independent provider reads | REQ-FLOW-1 |
 | T2 | S5 | S1/S2/S3/S4 | Provider response | Provider normalizer and service | Response fields are valid and sanitized | Atomically replace provider state and clear stale error | REQ-DATA-1, REQ-RECOVERY-1 |
-| T3 | S5 | S6 | Provider failure | Service | Prior consequential credits exist and are no older than 15 minutes | Preserve amount with explicit stale state | REQ-FRESH-1 |
-| T4 | S5/S6 | S7 | Provider failure or clock expiry | Service | No valid prior amount or stale age exceeds 15 minutes | Remove amount from compact label and expose Unavailable | REQ-FRESH-2 |
+| T3 | S5 | S6 | Provider failure | Service | Any prior credit observation exists and is no older than 15 minutes | Preserve the prior current/off state with explicit stale freshness; only consequential data remains label-eligible | REQ-FRESH-1 |
+| T4 | S5/S6 | S7 | Provider failure or clock expiry | Service | No valid prior credit observation, age is negative, or stale age exceeds 15 minutes | Remove credit data from the compact label and expose Unavailable | REQ-FRESH-2 |
 | T5 | S5 | S8 | Provider authentication rejection | Service | Provider explicitly reports rejected credentials | Expose existing reauthentication action without leaking credentials | REQ-AUTH-1 |
-| T6 | S8 | S5 | User selects Refresh after provider login | User and service | Provider login has completed outside the plugin | Revalidate authentication and usage state | REQ-AUTH-2 |
+| T6 | S8 | S5 | User selects Refresh after provider login | User and service | Provider login has completed outside the plugin; if an older owner is running, queue exactly one follow-up read after it | Revalidate authentication and usage state from a read that starts no earlier than the user's request | REQ-AUTH-2 |
 
 ### Lifecycle behavior
 
 | Transition ID | Cancellation | Interruption | Retry/recovery | Supersession/stale result | Resume/revalidation |
 |---|---|---|---|---|---|
-| T1 | No cancellation control; read is short and non-destructive | Menu may close without cancelling the service refresh | Automatic or later manual refresh | Concurrent request waits for the active owner | Result updates shared query data independent of menu visibility |
+| T1 | No cancellation control; read is short and non-destructive | Menu may close without cancelling the service refresh | Automatic callers share the active owner; manual callers requested after that owner started coalesce into one follow-up | An owner's result cannot satisfy a later manual request; one follow-up supersedes it for that request | Result updates shared query data independent of menu visibility |
 | T2 | n/a | Atomic write prevents partial cache visibility | Successful response is the recovery path | Serialized owner prevents an older concurrent completion | Validate and normalize at completion before persistence |
 | T3 | n/a | Renderer may unmount; stale snapshot remains service-owned | Next timer or manual Refresh retries | Observation time prevents stale data appearing current | Recheck age on every service read/render |
 | T4 | n/a | Unavailable state survives menu close/reopen | Next successful refresh recovers | No stale amount may re-enter after expiry without a new success | Full provider read is required |
@@ -324,13 +366,13 @@ Refresh is short, read-only, and serialized. It does not need a user-facing canc
 
 - **REQ-UI-1:** Every popover visibly contains a truthful Credits section in every supported state.
 - **REQ-LABEL-1:** Non-consequential credits leave the existing compact allowance label unchanged.
-- **REQ-LABEL-2:** Consequential credits show no more than the controlling exhausted allowance and native credit summary.
+- **REQ-LABEL-2:** Consequential credits show no more than one selected account allowance and the native credit summary; an exhausted controlling allowance wins, otherwise the valid short/weekly window with the lowest remaining percentage wins.
 - **REQ-DATA-1:** A successful refresh updates windows and credits from one provider observation without exposing raw payloads or credentials.
 - **REQ-STATE-1:** Low appears only with a valid denominator at 20% or less remaining.
 - **REQ-STATE-2:** Exhausted appears only from explicit provider zero or reached state.
-- **REQ-FLOW-1:** Concurrent refresh requests produce one provider read and restore the Refresh control on every exit.
-- **REQ-FRESH-1:** A failed refresh preserves last-known consequential credits as visibly stale for no more than 15 minutes.
-- **REQ-FRESH-2:** After 15 minutes, stale monetary data becomes unavailable and leaves the compact label.
+- **REQ-FLOW-1:** Concurrent automatic refreshes share one service-level owner, while manual refreshes issued after that owner started coalesce into exactly one follow-up read; the Refresh control restores on every exit.
+- **REQ-FRESH-1:** A failed refresh preserves any last-known current/off credit state as visibly stale in the popover for no more than 15 minutes; only consequential states remain eligible for the compact label.
+- **REQ-FRESH-2:** After 15 minutes, stale credit data becomes unavailable and leaves the compact label.
 - **REQ-ERROR-1:** Malformed credit data cannot erase valid allowance windows or appear as zero/off.
 - **REQ-RECOVERY-1:** A later successful refresh clears stale/error state without reloading the plugin.
 - **REQ-AUTH-1:** Authentication rejection exposes the existing provider-specific reauthentication path without leaking credential material.
@@ -354,9 +396,10 @@ Evidence gaps to close during implementation:
 
 Cover:
 
-- Claude enabled, off, zero spend, active, low, exhausted, missing cap, invalid currency, and malformed values;
-- Codex finite balance, zero, unlimited, hidden balance, individual monthly limit, spend-control reached, and absent data;
+- Claude enabled, off, zero spend, active, low, exhausted, exhausted-at-0%-with-Low-suppressed, missing cap, invalid currency, and malformed values;
+- Codex finite balance, zero, unlimited, `hasCredits: false`, `hasCredits: true` with hidden balance, individual monthly limit, spend-control reached, and absent data;
 - provider-specific unit conversion and exact decimal preservation;
+- invalid cross-unit fields and spend-only `remaining_percent` scoping;
 - rejection of booleans, NaN, infinity, negatives, and ambiguous strings;
 - active, low, exhausted, and unavailable derivation without local inference.
 
@@ -367,12 +410,15 @@ Cover:
 - current allowances with unavailable credits;
 - current credits with provider-specific source and observation time;
 - transient failure to bounded stale state;
+- failure and expiry from non-consequential `Off` and enabled-zero states;
 - stale expiry after 15 minutes;
+- negative freshness age expiring immediately;
 - later success clearing stale state;
 - independent provider failure and recovery;
-- concurrent refreshes sharing one provider read;
+- concurrent automatic refreshes sharing one provider read;
+- manual refresh issued during an older in-flight read triggering exactly one follow-up provider read;
 - authentication-required behavior;
-- cache and API payloads excluding credentials and raw provider data.
+- closed `source`/`error_code` vocabularies and cache/API payloads excluding credentials and raw provider data.
 
 ### Desktop contract tests
 
@@ -381,9 +427,10 @@ Cover:
 - a Credits section for both providers;
 - approved copy for every credit state;
 - consequential-label selection and controlling-window priority;
+- lowest-remaining allowance selection when no account allowance is exhausted;
 - at-most-two-facts compact label rule;
 - provider-native Claude currency and Codex credit-unit formatting;
-- accessible progress semantics;
+- textual Low/Exhausted precedence without color dependence;
 - existing keyboard-operable Refresh and Reauthenticate controls;
 - incremented query contract version.
 
@@ -402,7 +449,7 @@ Exercise the installed plugin at normal desktop width and a constrained status-b
 - authentication required;
 - refreshing and refresh recovery.
 
-Inspect label geometry, truncation, menu spacing, focus order, hit targets, overflow, zoom, progress semantics, and console errors. Use deterministic mocked data for states the live account cannot produce and separately exercise the installed plugin with current live provider state.
+Inspect label geometry, truncation, menu spacing, focus order, hit targets, overflow, zoom, text-row hierarchy, and console errors. Use deterministic mocked data for states the live account cannot produce and separately exercise the installed plugin with current live provider state.
 
 ### Repository checks
 
@@ -419,7 +466,7 @@ Update `README.md` to explain:
 - Claude monetary extra-usage spend versus Codex provider-native credit units;
 - when credits appear in compact labels;
 - current, stale, off, exhausted, unlimited, and unavailable states;
-- provider sources and the 15-minute monetary stale bound;
+- provider sources and the 15-minute credit stale bound;
 - sanitized local persistence and privacy guarantees;
 - troubleshooting when allowance data exists but credit data is unavailable.
 
@@ -429,8 +476,8 @@ The feature is technically complete only when:
 
 1. Both provider popovers always render a truthful Credits section.
 2. Claude displays provider-reported spend/cap currency and Codex displays provider-native credit units without invented currency.
-3. Compact labels follow the accepted consequential and controlling-window rules.
-4. Credit freshness is independent from allowance freshness and stale monetary data expires after 15 minutes.
+3. Compact labels follow the accepted consequential and account-allowance selection rules.
+4. Credit freshness is independent from allowance freshness and stale credit data expires after 15 minutes.
 5. Existing refresh, authentication, visibility-menu, and keyboard behavior regressions are absent.
 6. Automated tests, JavaScript syntax validation, and plugin validation pass.
 7. Required states are verified in rendered Hermes Desktop behavior at normal and constrained widths.
