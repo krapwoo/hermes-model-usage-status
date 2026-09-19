@@ -1,7 +1,7 @@
 # Claude and Codex Credit Usage Design
 
 - **Date:** 2026-09-19
-- **Status:** Approved product design; awaiting written-spec review
+- **Status:** Approved written specification; ready for implementation planning
 - **Project:** Hermes Model Usage Status
 - **Scope:** Provider-native monetary or monetary-like credits in the existing Claude and Codex status items
 
@@ -191,7 +191,7 @@ Contract rules:
 - `active` must come from reported spend or an explicit provider condition proving credit-backed continuation. Local balance history and token activity are not evidence of active spending.
 - Invalid, negative, non-finite, boolean, or ambiguous values invalidate only the affected credit block.
 - `observed_at` is stamped locally in UTC epoch seconds when the provider response is received. Age is computed against the same wall clock; a negative age or an age over the applicable bound is expired, never current.
-- Permitted `source` values are `claude-oauth-usage`, `codex-app-server`, or `null` before any successful credit observation. Permitted `error_code` values are `auth_rejected`, `timeout`, `rate_limited`, `malformed`, `unsupported`, or `null`. Neither field is rendered verbatim to the user.
+- Permitted `source` values are `claude-oauth-usage`, `codex-app-server`, or `null` before any successful credit observation. Permitted `error_code` values are `auth_rejected`, `timeout`, `rate_limited`, `provider_unavailable`, `malformed`, `unsupported`, or `null`. Neither field is rendered verbatim to the user.
 
 ### Claude acquisition and normalization
 
@@ -205,7 +205,7 @@ Normalize:
 - provider currency plus minor-unit spend and cap without guessing scale;
 - provider `decimal_places` to `minor_unit_scale`, rejecting absent, boolean, fractional, negative, or greater-than-six scales for enabled monetary amounts;
 - spend greater than zero to `active: true`;
-- zero cap remaining to `exhausted: true`;
+- zero remaining spend allowance to `exhausted: true` when the positive monthly cap is fully consumed;
 - a valid remaining ratio of 20% or less to `low: true`.
 
 The passive Claude status-line observation can recover allowance windows only. It does not contain `extra_usage`; therefore it cannot make credits current. A prior current or off credit state must remain visibly stale within the 15-minute bound, otherwise credits become unavailable.
