@@ -97,8 +97,8 @@ Credit data has its own observation time and freshness state. A failed refresh m
 
 - The plugin backend makes one OAuth usage request using Hermes's existing Claude credential resolver so the same response supplies allowance windows and structured `extra_usage` fields.
 - The resolved token exists only in memory for that request. It is never logged, persisted, cached, or returned to the Desktop renderer.
-- The raw provider response is normalized immediately and discarded; only the sanitized provider snapshot is persisted.
-- Do not parse the shared account-usage adapter's formatted `details` text. That representation omits the `Off` state, can default an absent currency, and does not preserve the structured minor-unit scale required by this design.
+- The raw provider response is normalized immediately and discarded. It is never logged, persisted, cached, or returned to the Desktop renderer, including on timeout, non-2xx, and parse-failure paths; only the sanitized provider snapshot is persisted.
+- Do not parse the shared account-usage adapter's formatted `details` text for any credit field. That representation omits the `Off` state, can default an absent currency, and does not preserve the structured minor-unit scale required by this design. The passive status-line path remains available for allowance windows only.
 
 ## Architecture
 
@@ -175,8 +175,9 @@ Codex example with both a balance and a monthly spend-control limit:
 Contract rules:
 
 - `status` is `current`, `off`, or `unavailable`. It describes credit entitlement and data presence, not observation age. `freshness` independently describes observation age as `current` or `stale` for a retained `current`/`off` observation and is `null` when status is `unavailable`.
-- `unit` governs the entire credit block. `currency` and `minor_unit_scale` are required only when an enabled `currency` block contains monetary amounts. Currency is exactly three uppercase ASCII letters. The scale is a provider-reported integer from 0 through 6; never infer it from the currency code.
-- Claude currency values use `spend.used_minor` and `spend.limit_minor`. Accept non-negative integers or integral finite floats only, preserve them as integers, and format them in the renderer with `Intl.NumberFormat` configured to the explicit `minor_unit_scale`.
+- `unit` is exactly `currency` or `credits`, governs the entire credit block, and is non-null in every emitted block. A Claude `off` or `unavailable` block uses `unit: "currency"`, `currency: null`, and `minor_unit_scale: null`.
+- `currency` and `minor_unit_scale` are required only when an enabled `currency` block contains monetary amounts. Currency is exactly three uppercase ASCII letters. The scale is a provider-reported integer from 0 through 6; never infer it from the currency code.
+- Claude currency values use `spend.used_minor` and `spend.limit_minor`. Accept non-negative integers or integral finite floats only and preserve them as integers. Format with `Intl.NumberFormat` using the explicit `minor_unit_scale`: if `amount_minor % (10 ** minor_unit_scale) == 0`, use zero fractional digits; otherwise set both minimum and maximum fractional digits to `minor_unit_scale`. Therefore 1840 at scale 2 renders `$18.40`, while 10000 at scale 2 renders `$100`.
 - Codex balances use `balance.amount_credits`. Optional monthly-limit amounts use `spend.used_credits` and `spend.limit_credits`. These remain validated decimal strings because the provider contract supplies credit amounts, not a currency.
 - `balance.available: true` with `amount_credits: null` means the provider confirmed credit availability but withheld the amount; it is current, non-consequential, and popover-only.
 - `*_minor` fields are invalid when `unit` is `credits`; `*_credits` fields are invalid when `unit` is `currency`. A violation invalidates only the credit block.
@@ -184,6 +185,7 @@ Contract rules:
 - `spend.remaining_percent` always describes the `spend` subobject, never `balance`, and exists only when the provider supplies a valid denominator or authoritative remaining percentage.
 - `low` means 20% or less remains and is false when no denominator exists.
 - `exhausted` requires an explicit provider zero or reached-spend-control signal.
+- Negative-value rejection applies to provider-supplied fields. When valid `used_minor >= limit_minor`, clamp the derived `remaining_percent` to 0 and set `exhausted: true` rather than invalidating the block.
 - When `exhausted` and `low` are both true, `Exhausted` suppresses `Low` in all rendered copy; the normalized `low` flag may remain true.
 - `active` must come from reported spend or an explicit provider condition proving credit-backed continuation. Local balance history and token activity are not evidence of active spending.
 - Invalid, negative, non-finite, boolean, or ambiguous values invalidate only the affected credit block.
@@ -196,6 +198,7 @@ One plugin-backend OAuth usage read captures both allowance windows and `extra_u
 
 Normalize:
 
+- an absent or non-object `extra_usage` to `status: unavailable`, `freshness: null`, `unit: currency`, `currency: null`, `minor_unit_scale: null`, and `error_code: unsupported`; it must never become `off`;
 - `is_enabled: false` to `status: off`;
 - valid enabled spend and cap to a currency `spend` object;
 - provider currency plus minor-unit spend and cap without guessing scale;
@@ -274,7 +277,7 @@ When `individualLimit` is present, show a second text-only `Monthly credit limit
    - if the percentages tie, weekly;
    - otherwise none.
 3. Format the provider-native credit summary:
-   - Claude: `Credits <used>/<limit>`; convert integer minor units with the reported currency's standard minor-unit scale, render the exact amount, omit fractional digits for whole values, and otherwise preserve the full native fractional value; never approximate, truncate, or round beyond that exact conversion;
+   - Claude: `Credits <used>/<limit>`; convert integer minor units with the credit block's provider-reported `minor_unit_scale`, render the exact amount, omit fractional digits for whole values, and otherwise preserve the full native fractional value; never approximate, truncate, or round beyond that exact conversion;
    - Codex: `<amount> credits left` or `Unlimited`, using the validated decimal balance when present; if no balance summary exists and spend control is reached, use `Monthly limit reached`.
 4. When `low` or `exhausted` is true, append `Low` or `Exhausted` to the credit summary for either provider; `Exhausted` takes precedence. When a Codex qualifier derives from `spend` while the summary shows `balance`, use `Monthly limit low` or `Monthly limit reached` so the qualifier names the controlling value. Do not repeat a qualifier already present in the base summary.
 5. Render provider name, optional selected allowance, and credit summary.
@@ -396,7 +399,7 @@ No product decision remains unresolved.
 
 Evidence gaps to close during implementation:
 
-- Observe current live Claude and Codex credit payloads without recording private account values in repository artifacts.
+- Observe current live Claude and Codex credit payloads without recording private account values in repository artifacts. Confirm that enabled Claude payloads contain both `extra_usage.currency` and `extra_usage.decimal_places`; if either is absent, return to design review rather than repairing or inferring it during implementation.
 - Confirm the exact Codex `individualLimit` display unit against the installed Codex version; retain the provider's `credits` wording unless a currency is explicitly supplied.
 - Verify all designed visual states in the actual Hermes host; states unavailable from live accounts require deterministic mocked renderer data.
 
@@ -408,7 +411,7 @@ Evidence gaps to close during implementation:
 
 Cover:
 
-- Claude enabled, off, zero spend, active, low, exhausted, exhausted-at-0%-with-Low-suppressed, missing cap, invalid currency, and malformed values;
+- Claude enabled, off, zero spend, active, low, exhausted, over-cap `used_minor > limit_minor`, exhausted-at-0%-with-Low-suppressed, absent/non-object `extra_usage`, missing cap, invalid currency, and malformed values;
 - Claude minor-unit scales 0, 2, and 3; integral-float minor amounts; and missing, boolean, fractional, negative, or oversized scales;
 - Codex finite balance, zero, unlimited, `hasCredits: false`, `hasCredits: true` with hidden balance, individual monthly limit, spend-control reached with and without a remaining balance, overlapping-signal precedence, contradictory-signal rejection, and absent data;
 - provider-specific unit conversion and exact decimal preservation;
@@ -421,7 +424,7 @@ Cover:
 Cover:
 
 - current allowances with unavailable credits;
-- a single Claude OAuth response supplying both windows and credits without persisting or returning token/raw-response material;
+- a single Claude OAuth response supplying both windows and credits without logging, persisting, caching, or returning token/raw-response material on success, authentication rejection, timeout, non-2xx, or malformed-response paths;
 - current credits with provider-specific source and observation time;
 - transient failure to bounded stale state;
 - failure and expiry from non-consequential `Off` and enabled-zero states;
@@ -432,7 +435,7 @@ Cover:
 - concurrent automatic refreshes sharing one provider read;
 - manual refresh issued during an older in-flight read triggering exactly one follow-up provider read;
 - authentication-required behavior;
-- closed `source`/`error_code` vocabularies and cache/API payloads excluding credentials and raw provider data.
+- closed `unit`/`source`/`error_code` vocabularies and cache/API payloads excluding credentials and raw provider data.
 
 ### Desktop contract tests
 
@@ -444,6 +447,7 @@ Cover:
 - lowest-remaining allowance selection when no account allowance is exhausted;
 - at-most-two-facts compact label rule;
 - provider-native Claude currency and Codex credit-unit formatting;
+- matching Claude label/popover amounts for a non-USD currency whose standard scale differs from the provider-reported scale and for USD at scale 3, plus the `$18.40`/`$100` fractional-digit oracles;
 - Codex `Monthly limit low`/`Monthly limit reached` qualifier provenance and existing allowance percentage formatting;
 - textual Low/Exhausted precedence without color dependence;
 - existing keyboard-operable Refresh and Reauthenticate controls;
