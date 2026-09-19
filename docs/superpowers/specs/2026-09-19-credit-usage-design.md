@@ -103,19 +103,26 @@ Credit data has its own observation time and freshness state. A failed refresh m
 
 ### Normalized credit contract
 
-Each provider object gains a nullable `credits` object. The renderer contract version must increment so older allowance-only cached query data cannot appear complete.
+Each provider object gains a nullable `credits` object. Increment both the persisted snapshot schema and the renderer query-contract version. A schema-v1 allowance-only cache must trigger a refresh rather than appear to contain complete credit data.
 
 ```json
 {
   "credits": {
     "status": "current | stale | off | unavailable",
-    "mode": "spend_cap | balance | unlimited | spend_limit",
     "unit": "currency | credits",
     "currency": "USD or null",
-    "used_minor": 1840,
-    "limit_minor": 10000,
-    "balance": "9.5",
-    "remaining_percent": 81.6,
+    "balance": {
+      "amount_credits": "9.5",
+      "unlimited": false
+    },
+    "spend": {
+      "used_minor": 1840,
+      "limit_minor": 10000,
+      "used_credits": null,
+      "limit_credits": null,
+      "remaining_percent": 81.6,
+      "resets_at": 1792800000
+    },
     "active": true,
     "low": false,
     "exhausted": false,
@@ -129,9 +136,10 @@ Each provider object gains a nullable `credits` object. The renderer contract ve
 Contract rules:
 
 - `currency` is required only when `unit` is `currency`.
-- Currency values use integer minor units; formatting happens in the renderer with `Intl.NumberFormat`.
-- Codex credit balances remain validated decimal strings because the provider contract supplies a string credit amount, not a currency.
-- `remaining_percent` exists only when the provider supplies a valid denominator or authoritative remaining percentage.
+- Claude currency values use `spend.used_minor` and `spend.limit_minor`; formatting happens in the renderer with `Intl.NumberFormat`.
+- Codex balances use `balance.amount_credits`. Optional monthly-limit amounts use `spend.used_credits` and `spend.limit_credits`. These remain validated decimal strings because the provider contract supplies credit amounts, not a currency.
+- A provider may supply both `balance` and `spend`; this is required for Codex accounts that expose a remaining balance and a monthly spend-control limit in the same snapshot.
+- `spend.remaining_percent` exists only when the provider supplies a valid denominator or authoritative remaining percentage.
 - `low` means 20% or less remains and is false when no denominator exists.
 - `exhausted` requires an explicit provider zero or reached-spend-control signal.
 - `active` must come from reported spend or an explicit provider condition proving credit-backed continuation. Local balance history and token activity are not evidence of active spending.
@@ -144,7 +152,7 @@ One credential-safe OAuth usage read captures both allowance windows and `extra_
 Normalize:
 
 - `is_enabled: false` to `status: off`;
-- valid enabled spend and cap to `mode: spend_cap`;
+- valid enabled spend and cap to a currency `spend` object;
 - provider currency plus minor-unit spend and cap without guessing scale;
 - spend greater than zero to `active: true`;
 - zero cap remaining to `exhausted: true`;
@@ -164,10 +172,10 @@ The existing `account/rateLimits/read` response already carries allowance snapsh
 
 Normalize:
 
-- `unlimited: true` to `mode: unlimited`;
-- `hasCredits: true` plus a valid balance to `mode: balance`;
+- `unlimited: true` to `balance.unlimited: true`;
+- `hasCredits: true` plus a valid balance to `balance.amount_credits`;
 - explicit zero balance or reached spend control to `exhausted: true`;
-- the optional individual monthly limit to a secondary `spend_limit` row using provider-native credit units;
+- the optional individual monthly limit to a `spend` object using provider-native credit units;
 - provider-reported spend or explicit credit-backed continuation to `active: true`.
 
 `rateLimitResetCredits` is unrelated to monetary credit balance and remains out of scope.
