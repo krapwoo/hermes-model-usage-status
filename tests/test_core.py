@@ -8,11 +8,15 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from model_usage_status.core import (  # noqa: E402
+    age_credit_state,
     build_codex_messages,
+    merge_credit_refresh_result,
     merge_refresh_result,
+    normalize_claude_oauth_result,
     normalize_claude_payload,
     normalize_codex_result,
     prepare_claude_observation,
+    unavailable_credits,
 )
 
 
@@ -189,6 +193,267 @@ class ClaudeNormalizationTests(unittest.TestCase):
         advanced = prepare_claude_observation(payload, previous=previous, now=1100)
 
         self.assertEqual(advanced["observed_at"], 1100)
+
+
+class ClaudeCreditNormalizationTests(unittest.TestCase):
+    def oauth_payload(self, extra_usage: object) -> dict:
+        return {
+            "five_hour": {"utilization": 0.235, "resets_at": "2026-09-20T01:00:00Z"},
+            "seven_day": {"utilization": 0.412, "resets_at": "2026-09-25T01:00:00Z"},
+            "extra_usage": extra_usage,
+        }
+
+    def test_enabled_currency_credit_contract_uses_reported_minor_scale(self) -> None:
+        provider = normalize_claude_oauth_result(self.oauth_payload({
+            "is_enabled": True,
+            "used_credits": 1840.0,
+            "monthly_limit": 10000,
+            "currency": "USD",
+            "decimal_places": 2,
+        }), observed_at=100)
+
+        self.assertEqual(provider["status"], "current")
+        self.assertEqual([window["remaining_percent"] for window in provider["windows"]], [76.5, 58.8])
+        self.assertEqual(provider["credits"], {
+            "status": "current", "freshness": "current", "unit": "currency",
+            "currency": "USD", "minor_unit_scale": 2, "balance": None,
+            "spend": {"used_minor": 1840, "limit_minor": 10000,
+                      "remaining_percent": 81.6, "resets_at": None},
+            "active": True, "low": False, "exhausted": False,
+            "observed_at": 100, "source": "claude-oauth-usage", "error_code": None,
+        })
+
+    def test_off_is_not_unavailable(self) -> None:
+        credits = normalize_claude_oauth_result(
+            self.oauth_payload({"is_enabled": False}), observed_at=100
+        )["credits"]
+        self.assertEqual(credits["status"], "off")
+        self.assertEqual(credits["freshness"], "current")
+        self.assertFalse(credits["active"])
+        self.assertIsNone(credits["currency"])
+
+    def test_absent_and_non_object_extra_usage_are_unsupported(self) -> None:
+        for extra_usage in (None, "not-an-object"):
+            with self.subTest(extra_usage=extra_usage):
+                credits = normalize_claude_oauth_result(
+                    self.oauth_payload(extra_usage), observed_at=100
+                )["credits"]
+                self.assertEqual(credits, unavailable_credits("currency", "unsupported"))
+
+    def test_enabled_amounts_without_reported_scale_are_malformed(self) -> None:
+        credits = normalize_claude_oauth_result(self.oauth_payload({
+            "is_enabled": True, "used_credits": 0, "monthly_limit": 10000,
+            "currency": "USD",
+        }), observed_at=100)["credits"]
+        self.assertEqual(credits, unavailable_credits("currency", "malformed"))
+
+    def test_over_cap_clamps_remaining_and_rejects_zero_cap_without_signal(self) -> None:
+        over = normalize_claude_oauth_result(self.oauth_payload({
+            "is_enabled": True, "used_credits": 12000, "monthly_limit": 10000,
+            "currency": "USD", "decimal_places": 2,
+        }), observed_at=100)["credits"]
+        zero_cap = normalize_claude_oauth_result(self.oauth_payload({
+            "is_enabled": True, "used_credits": 0, "monthly_limit": 0,
+            "currency": "USD", "decimal_places": 2,
+        }), observed_at=100)["credits"]
+        self.assertEqual(over["spend"]["remaining_percent"], 0.0)
+        self.assertTrue(over["exhausted"])
+        self.assertTrue(over["low"])
+        self.assertEqual(zero_cap["status"], "unavailable")
+        self.assertEqual(zero_cap["error_code"], "unsupported")
+
+    def test_scale_and_minor_amount_validation(self) -> None:
+        for scale in (0, 2, 3):
+            with self.subTest(valid_scale=scale):
+                credits = normalize_claude_oauth_result(self.oauth_payload({
+                    "is_enabled": True, "used_credits": 1840.0,
+                    "monthly_limit": 10000, "currency": "USD",
+                    "decimal_places": scale,
+                }), observed_at=100)["credits"]
+                self.assertEqual(credits["status"], "current")
+                self.assertEqual(credits["minor_unit_scale"], scale)
+
+        for invalid in (True, 1.5, -1, 7):
+            with self.subTest(invalid_scale=invalid):
+                credits = normalize_claude_oauth_result(self.oauth_payload({
+                    "is_enabled": True, "used_credits": 1840,
+                    "monthly_limit": 10000, "currency": "USD",
+                    "decimal_places": invalid,
+                }), observed_at=100)["credits"]
+                self.assertEqual(credits["status"], "unavailable")
+                self.assertEqual(credits["error_code"], "malformed")
+
+        for invalid in (True, -1, 1.5, float("nan"), float("inf")):
+            with self.subTest(invalid_amount=invalid):
+                credits = normalize_claude_oauth_result(self.oauth_payload({
+                    "is_enabled": True, "used_credits": invalid,
+                    "monthly_limit": 10000, "currency": "USD",
+                    "decimal_places": 2,
+                }), observed_at=100)["credits"]
+                self.assertEqual(credits["status"], "unavailable")
+                self.assertEqual(credits["error_code"], "malformed")
+
+    def test_passive_payload_never_claims_current_credits(self) -> None:
+        provider = normalize_claude_payload({
+            "rate_limits": {"five_hour": {"used_percentage": 10, "resets_at": 200}},
+        }, observed_at=100)
+        self.assertEqual(provider["windows"][0]["remaining_percent"], 90.0)
+        self.assertEqual(provider["credits"], unavailable_credits("currency", "unsupported"))
+
+
+class CodexCreditNormalizationTests(unittest.TestCase):
+    def result(self, credits: object, individual_limit: object = None,
+               *, spend_control_reached: object = False,
+               ordinary_usage_allowed: object = True) -> dict:
+        return {
+            "ordinaryUsageAllowed": ordinary_usage_allowed,
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": 57, "windowDurationMins": 10080, "resetsAt": 5000},
+                "secondary": None,
+                "credits": credits,
+                "individualLimit": individual_limit,
+                "spendControlReached": spend_control_reached,
+            },
+            "rateLimitsByLimitId": {},
+        }
+
+    def test_balance_and_monthly_limit_can_coexist(self) -> None:
+        provider = normalize_codex_result(self.result(
+            {"hasCredits": True, "unlimited": False, "balance": "9.5"},
+            {"limit": "12.0", "used": "2.5", "remainingPercent": 79.1666666667,
+             "resetsAt": 1792800000},
+            ordinary_usage_allowed=False,
+        ), observed_at=100)
+        self.assertEqual(provider["credits"]["balance"], {
+            "available": True, "amount_credits": "9.5", "unlimited": False,
+        })
+        self.assertEqual(provider["credits"]["spend"], {
+            "used_credits": "2.5", "limit_credits": "12.0",
+            "remaining_percent": 79.1666666667, "resets_at": 1792800000,
+        })
+        self.assertTrue(provider["credits"]["active"])
+
+    def test_hidden_off_unlimited_zero_and_reached_states_are_distinct(self) -> None:
+        cases = {
+            "hidden": ({"hasCredits": True, "unlimited": False, "balance": None}, "current", False),
+            "off": ({"hasCredits": False, "unlimited": False, "balance": None}, "off", False),
+            "unlimited": ({"hasCredits": True, "unlimited": True, "balance": None}, "current", False),
+            "zero": ({"hasCredits": True, "unlimited": False, "balance": "0"}, "current", True),
+        }
+        for name, (raw, status, exhausted) in cases.items():
+            with self.subTest(name=name):
+                credits = normalize_codex_result(self.result(raw), observed_at=100)["credits"]
+                self.assertEqual(credits["status"], status)
+                self.assertEqual(credits["exhausted"], exhausted)
+
+    def test_reached_spend_control_keeps_truthful_balance(self) -> None:
+        credits = normalize_codex_result(self.result(
+            {"hasCredits": True, "unlimited": False, "balance": "9.5"},
+            {"limit": "12", "used": "12", "remainingPercent": 0, "resetsAt": 200},
+            spend_control_reached=True,
+        ), observed_at=100)["credits"]
+        self.assertEqual(credits["balance"]["amount_credits"], "9.5")
+        self.assertTrue(credits["exhausted"])
+        self.assertEqual(credits["spend"]["remaining_percent"], 0.0)
+
+    def test_contradictory_and_ambiguous_values_are_malformed(self) -> None:
+        cases = [
+            {"hasCredits": False, "unlimited": False, "balance": "4"},
+            {"hasCredits": True, "unlimited": True, "balance": "4"},
+            {"hasCredits": True, "unlimited": False, "balance": "09.5"},
+            {"hasCredits": True, "unlimited": False, "balance": "NaN"},
+        ]
+        for raw in cases:
+            with self.subTest(raw=raw):
+                credits = normalize_codex_result(self.result(raw), observed_at=100)["credits"]
+                self.assertEqual(credits["status"], "unavailable")
+                self.assertEqual(credits["error_code"], "malformed")
+
+    def test_limit_thresholds_absence_and_invalid_numbers(self) -> None:
+        low = normalize_codex_result(self.result(
+            {"hasCredits": True, "unlimited": False, "balance": "9.5"},
+            {"limit": "10", "used": "8", "remainingPercent": 20, "resetsAt": 500},
+        ), observed_at=100)["credits"]
+        no_denominator = normalize_codex_result(self.result(
+            {"hasCredits": True, "unlimited": False, "balance": "9.5"}
+        ), observed_at=100)["credits"]
+        over = normalize_codex_result(self.result(
+            {"hasCredits": True, "unlimited": False, "balance": "1"},
+            {"limit": "10", "used": "12", "remainingPercent": 0, "resetsAt": 500},
+        ), observed_at=100)["credits"]
+        reached = normalize_codex_result(self.result(
+            {"hasCredits": True, "unlimited": False, "balance": None},
+            spend_control_reached=True,
+        ), observed_at=100)["credits"]
+        absent = normalize_codex_result(self.result(None), observed_at=100)["credits"]
+
+        self.assertTrue(low["low"])
+        self.assertEqual(low["spend"]["resets_at"], 500)
+        self.assertFalse(no_denominator["low"])
+        self.assertEqual(over["spend"]["remaining_percent"], 0.0)
+        self.assertTrue(over["exhausted"])
+        self.assertTrue(reached["exhausted"])
+        self.assertEqual(absent, unavailable_credits("credits", "unsupported"))
+
+        for invalid in (True, "-1", "1e2", "Infinity"):
+            with self.subTest(invalid=invalid):
+                credits = normalize_codex_result(self.result({
+                    "hasCredits": True, "unlimited": False, "balance": invalid,
+                }), observed_at=100)["credits"]
+                self.assertEqual(credits["status"], "unavailable")
+                self.assertEqual(credits["error_code"], "malformed")
+
+
+class CreditFreshnessTests(unittest.TestCase):
+    def current(self, *, unit: str = "credits", observed_at: int = 100,
+                status: str = "current", active: bool = True) -> dict:
+        result = unavailable_credits(unit, "provider_unavailable")
+        result.update({
+            "status": status, "freshness": "current", "observed_at": observed_at,
+            "source": "codex-app-server" if unit == "credits" else "claude-oauth-usage",
+            "error_code": None, "active": active,
+        })
+        if unit == "credits":
+            result["balance"] = {"available": True, "amount_credits": "9.5", "unlimited": False}
+        return result
+
+    def test_transient_failure_retains_current_and_off_as_bounded_stale(self) -> None:
+        for status, active in (("current", True), ("off", False)):
+            with self.subTest(status=status):
+                merged = merge_credit_refresh_result(
+                    self.current(status=status, active=active), None, now=999,
+                    error_code="provider_unavailable",
+                )
+                self.assertEqual(merged["status"], status)
+                self.assertEqual(merged["freshness"], "stale")
+                self.assertEqual(merged["observed_at"], 100)
+
+    def test_expired_negative_age_and_auth_rejection_are_unavailable(self) -> None:
+        cases = [(1001, "timeout"), (99, "timeout"), (200, "auth_rejected")]
+        for now, code in cases:
+            with self.subTest(now=now, code=code):
+                merged = merge_credit_refresh_result(self.current(), None, now, code)
+                self.assertEqual(merged["status"], "unavailable")
+                self.assertIsNone(merged["observed_at"])
+                self.assertIsNone(merged["balance"])
+                self.assertIsNone(merged["source"])
+
+    def test_cached_stale_aging_reuses_the_retained_safe_error_code(self) -> None:
+        stale = self.current(observed_at=100)
+        stale["freshness"] = "stale"
+        stale["error_code"] = "timeout"
+        bounded = age_credit_state(stale, now=999)
+        expired = age_credit_state(stale, now=1001)
+        self.assertEqual(bounded["freshness"], "stale")
+        self.assertEqual(expired, unavailable_credits("credits", "timeout"))
+
+    def test_cached_current_observation_with_negative_age_is_unavailable(self) -> None:
+        future = self.current(observed_at=101)
+        self.assertEqual(
+            age_credit_state(future, now=100),
+            unavailable_credits("credits", "provider_unavailable"),
+        )
 
 
 class FreshnessTests(unittest.TestCase):
