@@ -22,7 +22,7 @@ def load_plugin_api():
 class FakeService:
     def __init__(self) -> None:
         self.get_calls = 0
-        self.refresh_calls = 0
+        self.refresh_calls: list[bool] = []
         self.auth_calls: list[str] = []
         self.auth_error = None
 
@@ -30,8 +30,8 @@ class FakeService:
         self.get_calls += 1
         return {"mode": "cached"}
 
-    def refresh(self) -> dict:
-        self.refresh_calls += 1
+    def refresh(self, *, manual: bool = False) -> dict:
+        self.refresh_calls.append(manual)
         return {"mode": "refreshed"}
 
     def launch_reauthentication(self, provider: str) -> dict:
@@ -58,7 +58,7 @@ class PluginApiTests(unittest.TestCase):
         self.assertEqual(refreshed.status_code, 200)
         self.assertEqual(refreshed.json(), {"mode": "refreshed"})
         self.assertEqual(fake.get_calls, 1)
-        self.assertEqual(fake.refresh_calls, 1)
+        self.assertEqual(fake.refresh_calls, [True])
 
     def test_reauthentication_starts_only_for_supported_provider(self) -> None:
         module = load_plugin_api()

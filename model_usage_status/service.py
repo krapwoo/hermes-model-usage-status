@@ -298,17 +298,21 @@ class UsageService:
         codex_fetcher: Callable[[], dict[str, Any]] = fetch_codex_rate_limits,
         claude_fetcher: Callable[[int], dict[str, Any]] = fetch_claude_rate_limits,
         now: Callable[[], int] = lambda: int(time.time()),
+        monotonic: Callable[[], float] = time.monotonic,
         auth_checker: Callable[[str], dict[str, Any]] = authentication_status,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.codex_fetcher = codex_fetcher
         self.claude_fetcher = claude_fetcher
         self.now = now
+        self.monotonic = monotonic
         self.auth_checker = auth_checker
         self.cache_path = self.data_dir / "usage-cache.json"
         self.claude_path = self.data_dir / "claude-observation.json"
         self._state_lock = threading.Lock()
         self._refreshing = False
+        self._owner_started_at: float | None = None
+        self._followup_requested = False
         self._refresh_done = threading.Event()
         self._refresh_done.set()
 
@@ -409,38 +413,69 @@ class UsageService:
             atomic_write_json(self.cache_path, persisted)
             return persisted
 
-    def refresh(self) -> dict[str, Any]:
+    def _empty_snapshot(self, code: str) -> dict[str, Any]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "generated_at": self.now(),
+            "providers": {
+                "codex": self._unavailable("codex", code),
+                "claude": self._unavailable("claude", code),
+            },
+        }
+
+    def _read_cache_or_empty_aged(self) -> dict[str, Any]:
+        now = self.now()
+        cached = self._read_cache()
+        if cached is not None:
+            return self._aged_snapshot(cached, now)
+        return self._empty_snapshot("refresh_unavailable")
+
+    def _finish_owner_locked(self, done: threading.Event) -> bool:
+        if self._refresh_done is not done:
+            return False
+        self._refreshing = False
+        self._owner_started_at = None
+        self._followup_requested = False
+        done.set()
+        return True
+
+    def refresh(self, *, manual: bool = False) -> dict[str, Any]:
+        requested_at = self.monotonic()
         with self._state_lock:
             if self._refreshing:
+                if manual and self._owner_started_at is not None and self._owner_started_at < requested_at:
+                    self._followup_requested = True
                 done = self._refresh_done
                 is_owner = False
             else:
                 self._refreshing = True
+                self._owner_started_at = requested_at
+                self._followup_requested = False
                 self._refresh_done = threading.Event()
                 done = self._refresh_done
                 is_owner = True
 
         if not is_owner:
             done.wait(timeout=CODEX_TIMEOUT_SECONDS + CLAUDE_TIMEOUT_SECONDS + 5)
-            now = self.now()
-            cached = self._read_cache()
-            if cached is not None:
-                return self._with_authentication(self._aged_snapshot(cached, now))
-            return self._with_authentication({
-                "schema_version": SCHEMA_VERSION,
-                "generated_at": now,
-                "providers": {
-                    "codex": self._unavailable("codex", "refresh_unavailable"),
-                    "claude": self._unavailable("claude", "refresh_unavailable"),
-                },
-            })
+            return self._with_authentication(self._read_cache_or_empty_aged())
 
         try:
-            return self._refresh_once()
-        finally:
+            result = self._refresh_once()
+            while True:
+                with self._state_lock:
+                    if not self._followup_requested:
+                        if self._finish_owner_locked(done):
+                            return self._with_authentication(result)
+                        break
+                    self._followup_requested = False
+                    self._owner_started_at = self.monotonic()
+                result = self._refresh_once()
+        except BaseException:
             with self._state_lock:
-                self._refreshing = False
-                self._refresh_done.set()
+                self._finish_owner_locked(done)
+            raise
+
+        return self._with_authentication(self._read_cache_or_empty_aged())
 
     def _refresh_once(self) -> dict[str, Any]:
         now = self.now()
@@ -493,4 +528,4 @@ class UsageService:
             "providers": {"claude": claude, "codex": codex},
         }
         atomic_write_json(self.cache_path, snapshot)
-        return self._with_authentication(snapshot)
+        return snapshot

@@ -29,7 +29,7 @@ async def usage() -> dict:
 
 @router.post("/refresh")
 async def refresh() -> dict:
-    return await run_in_threadpool(service.refresh)
+    return await run_in_threadpool(service.refresh, manual=True)
 
 
 @router.post("/authentication/{provider}", status_code=status.HTTP_202_ACCEPTED)

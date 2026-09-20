@@ -547,6 +547,154 @@ class UsageServiceTests(unittest.TestCase):
             self.assertEqual(len(results), 2)
 
 
+def _capture_error(callable_, errors: list[Exception]) -> None:
+    try:
+        callable_()
+    except Exception as error:
+        errors.append(error)
+
+
+class RefreshOwnershipTests(unittest.TestCase):
+    def test_newer_manual_requests_coalesce_into_one_follow_up(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            calls = 0
+            first_started = threading.Event()
+            release_first = threading.Event()
+            followup_started = threading.Event()
+            release_followup = threading.Event()
+            ticks = iter([10.0, 20.0, 21.0, 30.0])
+
+            def codex_fetcher() -> dict:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    first_started.set()
+                    release_first.wait(timeout=2)
+                elif calls == 2:
+                    followup_started.set()
+                    release_followup.wait(timeout=2)
+                return codex_result(used=50 - calls)
+
+            service = UsageService(
+                Path(directory), codex_fetcher=codex_fetcher,
+                claude_fetcher=lambda observed_at: normalized_claude(observed_at),
+                now=lambda: 1000, monotonic=lambda: next(ticks),
+                auth_checker=authenticated,
+            )
+            results = []
+            owner = threading.Thread(target=lambda: results.append(service.refresh()))
+            owner.start()
+            self.assertTrue(first_started.wait(timeout=1))
+            waiter_count = 0
+            waiter_count_lock = threading.Lock()
+            both_waiting = threading.Event()
+            original_wait = service._refresh_done.wait
+
+            def observed_wait(timeout=None):
+                nonlocal waiter_count
+                with waiter_count_lock:
+                    waiter_count += 1
+                    if waiter_count == 2:
+                        both_waiting.set()
+                return original_wait(timeout)
+
+            manual_a = threading.Thread(target=lambda: results.append(service.refresh(manual=True)))
+            manual_b = threading.Thread(target=lambda: results.append(service.refresh(manual=True)))
+            with patch.object(service._refresh_done, "wait", side_effect=observed_wait):
+                manual_a.start()
+                manual_b.start()
+                self.assertTrue(both_waiting.wait(timeout=1))
+            release_first.set()
+            self.assertTrue(followup_started.wait(timeout=1))
+            release_followup.set()
+            for thread in (owner, manual_a, manual_b):
+                thread.join(timeout=2)
+
+            self.assertEqual(calls, 2)
+            self.assertEqual(len(results), 3)
+            self.assertTrue(all(result["generated_at"] == 1000 for result in results))
+
+    def test_manual_request_with_equal_timestamp_accepts_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            gate = threading.Event()
+            started = threading.Event()
+            calls = 0
+
+            def fetcher() -> dict:
+                nonlocal calls
+                calls += 1
+                started.set()
+                gate.wait(timeout=2)
+                return codex_result()
+
+            service = UsageService(
+                Path(directory), codex_fetcher=fetcher,
+                claude_fetcher=lambda observed_at: normalized_claude(observed_at),
+                now=lambda: 1000, monotonic=lambda: 10.0,
+                auth_checker=authenticated,
+            )
+            owner = threading.Thread(target=service.refresh)
+            manual = threading.Thread(target=lambda: service.refresh(manual=True))
+            owner.start()
+            self.assertTrue(started.wait(timeout=1))
+            waiting = threading.Event()
+            original_wait = service._refresh_done.wait
+
+            def observed_wait(timeout=None):
+                waiting.set()
+                return original_wait(timeout)
+
+            with patch.object(service._refresh_done, "wait", side_effect=observed_wait):
+                manual.start()
+                self.assertTrue(waiting.wait(timeout=1))
+            gate.set()
+            owner.join(timeout=2)
+            manual.join(timeout=2)
+            self.assertEqual(calls, 1)
+
+    def test_unexpected_owner_failure_releases_waiters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = UsageService(
+                Path(directory), now=lambda: 1000, monotonic=lambda: 10.0,
+                auth_checker=authenticated,
+            )
+            started = threading.Event()
+            release = threading.Event()
+
+            def fail_once() -> dict:
+                started.set()
+                release.wait(timeout=2)
+                raise RuntimeError("synthetic failure")
+
+            service._refresh_once = fail_once
+            owner_errors: list[Exception] = []
+            owner = threading.Thread(target=lambda: _capture_error(service.refresh, owner_errors))
+            waiter = threading.Thread(target=service.refresh)
+            owner.start()
+            self.assertTrue(started.wait(timeout=1))
+            waiter.start()
+            release.set()
+            owner.join(timeout=2)
+            waiter.join(timeout=2)
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(len(owner_errors), 1)
+
+    def test_stale_owner_token_cannot_deregister_a_new_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = UsageService(Path(directory), auth_checker=authenticated)
+            stale_done = threading.Event()
+            newer_done = threading.Event()
+            with service._state_lock:
+                service._refreshing = True
+                service._owner_started_at = 20.0
+                service._refresh_done = newer_done
+                released = service._finish_owner_locked(stale_done)
+            self.assertFalse(released)
+            self.assertTrue(service._refreshing)
+            self.assertEqual(service._owner_started_at, 20.0)
+            self.assertIs(service._refresh_done, newer_done)
+
+
 class CacheAdmissionTests(unittest.TestCase):
     def valid_snapshot(self) -> dict:
         return {
