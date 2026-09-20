@@ -56,21 +56,20 @@ _CREDIT_ERROR_CODES = {
 _TRANSIENT_CREDIT_CODES = {"timeout", "rate_limited", "provider_unavailable"}
 _DECIMAL_CREDITS = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z")
 _CURRENCY_CODE = re.compile(r"[A-Z]{3}\Z")
-_MAX_CREDIT_INTEGER = 10 ** 15
 
 
 def _sanitized_credit_unit(value: Any, default: str = "credits") -> str:
-    return value if value in {"currency", "credits"} else default
+    return value if isinstance(value, str) and value in {"currency", "credits"} else default
 
 
 def _sanitized_credit_error_code(value: Any) -> str:
-    return value if value in _CREDIT_ERROR_CODES and value is not None else "provider_unavailable"
+    return value if isinstance(value, str) and value in _CREDIT_ERROR_CODES else "provider_unavailable"
 
 
 def unavailable_credits(unit: str, error_code: str) -> dict[str, Any]:
-    if unit not in {"currency", "credits"}:
+    if not isinstance(unit, str) or unit not in {"currency", "credits"}:
         raise ValueError("invalid_credit_unit")
-    if error_code not in _CREDIT_ERROR_CODES or error_code is None:
+    if not isinstance(error_code, str) or error_code not in _CREDIT_ERROR_CODES:
         raise ValueError("invalid_credit_error_code")
     return {
         "status": "unavailable", "freshness": None, "unit": unit,
@@ -84,9 +83,9 @@ def _non_negative_integer(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value if 0 <= value <= _MAX_CREDIT_INTEGER else None
+        return value if value >= 0 else None
     if isinstance(value, float):
-        if not math.isfinite(value) or value < 0 or value > _MAX_CREDIT_INTEGER or int(value) != value:
+        if not math.isfinite(value) or value < 0 or int(value) != value:
             return None
         return int(value)
     return None
@@ -156,19 +155,18 @@ def _normalize_claude_credits(extra_usage: Any, observed_at: int) -> dict[str, A
     if limit_minor == 0:
         return unavailable_credits("currency", "unsupported")
 
-    remaining_percent = _remaining(Decimal(used_minor), Decimal(limit_minor))
-    remaining_percent = 0.0 if remaining_percent is None else round(remaining_percent, 1)
-    exhausted = remaining_percent <= 0.0
-    low = remaining_percent <= 20.0
+    raw_remaining = _remaining(Decimal(used_minor), Decimal(limit_minor))
+    exhausted = used_minor >= limit_minor
+    low = raw_remaining <= 20.0
 
     return {
         "status": "current", "freshness": "current", "unit": "currency",
         "currency": currency, "minor_unit_scale": scale, "balance": None,
         "spend": {
             "used_minor": used_minor, "limit_minor": limit_minor,
-            "remaining_percent": remaining_percent, "resets_at": None,
+            "remaining_percent": round(raw_remaining, 1), "resets_at": None,
         },
-        "active": True, "low": low, "exhausted": exhausted,
+        "active": used_minor > 0, "low": low, "exhausted": exhausted,
         "observed_at": int(observed_at), "source": "claude-oauth-usage", "error_code": None,
     }
 
@@ -222,9 +220,26 @@ def _codex_spend(individual_limit: Any) -> tuple[dict[str, Any] | None, bool]:
 def _normalize_codex_credits(
     result: dict[str, Any], account: dict[str, Any], observed_at: int
 ) -> dict[str, Any]:
-    # result is reserved for top-level provider signals (e.g. ordinaryUsageAllowed); unused today.
+    # Validate the complete sibling signal set before any early exit (Off/unsupported),
+    # so a malformed spendControlReached/individualLimit is never masked by them.
+    spend_control_reached = account.get("spendControlReached")
+    if not isinstance(spend_control_reached, bool):
+        return unavailable_credits("credits", "malformed")
+
+    spend, spend_malformed = _codex_spend(account.get("individualLimit"))
+    if spend_malformed:
+        return unavailable_credits("credits", "malformed")
+
     raw_credits = account.get("credits")
     if not isinstance(raw_credits, dict):
+        if spend_control_reached:
+            low = spend is not None and spend["remaining_percent"] is not None and spend["remaining_percent"] <= 20.0
+            return {
+                "status": "current", "freshness": "current", "unit": "credits",
+                "currency": None, "minor_unit_scale": None, "balance": None,
+                "spend": spend, "active": True, "low": low, "exhausted": True,
+                "observed_at": int(observed_at), "source": "codex-app-server", "error_code": None,
+            }
         return unavailable_credits("credits", "unsupported")
 
     has_credits = raw_credits.get("hasCredits")
@@ -233,9 +248,23 @@ def _normalize_codex_credits(
     if not isinstance(has_credits, bool) or not isinstance(unlimited, bool):
         return unavailable_credits("credits", "malformed")
 
-    if has_credits is False:
-        if unlimited or balance_raw is not None:
+    balance_amount: str | None = None
+    if balance_raw is not None:
+        balance_amount = _credit_decimal(balance_raw)
+        if balance_amount is None:
             return unavailable_credits("credits", "malformed")
+
+    if unlimited and balance_raw is not None:
+        return unavailable_credits("credits", "malformed")
+    if has_credits is False and unlimited:
+        return unavailable_credits("credits", "malformed")
+
+    is_zero_balance = balance_amount is not None and Decimal(balance_amount) == 0
+    is_positive_balance = balance_amount is not None and not is_zero_balance
+    if has_credits is False and is_positive_balance:
+        return unavailable_credits("credits", "malformed")
+
+    if has_credits is False and not spend_control_reached and not is_zero_balance:
         return {
             "status": "off", "freshness": "current", "unit": "credits",
             "currency": None, "minor_unit_scale": None, "balance": None,
@@ -243,44 +272,29 @@ def _normalize_codex_credits(
             "observed_at": int(observed_at), "source": "codex-app-server", "error_code": None,
         }
 
-    if unlimited and balance_raw is not None:
-        return unavailable_credits("credits", "malformed")
-
-    balance_amount: str | None = None
     if unlimited:
         balance = {"available": True, "amount_credits": None, "unlimited": True}
     else:
-        if balance_raw is not None:
-            balance_amount = _credit_decimal(balance_raw)
-            if balance_amount is None:
-                return unavailable_credits("credits", "malformed")
-        balance = {
-            "available": balance_amount is not None,
-            "amount_credits": balance_amount,
-            "unlimited": False,
-        }
-
-    spend, spend_malformed = _codex_spend(account.get("individualLimit"))
-    if spend_malformed:
-        return unavailable_credits("credits", "malformed")
-
-    spend_control_reached = account.get("spendControlReached")
-    if not isinstance(spend_control_reached, bool):
-        return unavailable_credits("credits", "malformed")
+        balance = {"available": True, "amount_credits": balance_amount, "unlimited": False}
 
     remaining_percent = spend["remaining_percent"] if spend else None
-    balance_zero = balance_amount is not None and Decimal(balance_amount) == 0
-    exhausted = bool(
-        (remaining_percent is not None and remaining_percent <= 0.0)
-        or balance_zero
-        or spend_control_reached
+    spend_used_positive = (
+        spend is not None and spend["used_credits"] is not None and Decimal(spend["used_credits"]) > 0
     )
+    ordinary_usage_allowed = result.get("ordinaryUsageAllowed")
+
+    exhausted = bool(
+        spend_control_reached
+        or is_zero_balance
+        or (remaining_percent is not None and remaining_percent <= 0.0)
+    )
+    active = bool(spend_control_reached or spend_used_positive or ordinary_usage_allowed is False)
     low = remaining_percent is not None and remaining_percent <= 20.0
 
     return {
         "status": "current", "freshness": "current", "unit": "credits",
         "currency": None, "minor_unit_scale": None, "balance": balance,
-        "spend": spend, "active": True, "low": low, "exhausted": exhausted,
+        "spend": spend, "active": active, "low": low, "exhausted": exhausted,
         "observed_at": int(observed_at), "source": "codex-app-server", "error_code": None,
     }
 
@@ -314,7 +328,7 @@ def merge_credit_refresh_result(
         aged["error_code"] = _sanitized_credit_error_code(error_code)
         return aged
 
-    if error_code in _TRANSIENT_CREDIT_CODES:
+    if isinstance(error_code, str) and error_code in _TRANSIENT_CREDIT_CODES:
         aged = deepcopy(aged)
         aged["freshness"] = "stale"
         aged["error_code"] = error_code
@@ -618,6 +632,15 @@ def merge_refresh_result(
     credit_unit: str | None = None,
     credit_error_code: str | None = None,
 ) -> dict[str, Any]:
+    if credit_unit is not None and (
+        not isinstance(credit_unit, str) or credit_unit not in {"currency", "credits"}
+    ):
+        raise ValueError("invalid_credit_unit")
+    if credit_error_code is not None and (
+        not isinstance(credit_error_code, str) or credit_error_code not in _CREDIT_ERROR_CODES
+    ):
+        raise ValueError("invalid_credit_error_code")
+
     provider_id = None
     if isinstance(fresh, dict):
         provider_id = fresh.get("id")
