@@ -421,13 +421,14 @@ class UsageService:
                 is_owner = True
 
         if not is_owner:
-            done.wait(timeout=CODEX_TIMEOUT_SECONDS + 5)
+            done.wait(timeout=CODEX_TIMEOUT_SECONDS + CLAUDE_TIMEOUT_SECONDS + 5)
+            now = self.now()
             cached = self._read_cache()
             if cached is not None:
-                return self._with_authentication(cached)
+                return self._with_authentication(self._aged_snapshot(cached, now))
             return self._with_authentication({
                 "schema_version": SCHEMA_VERSION,
-                "generated_at": self.now(),
+                "generated_at": now,
                 "providers": {
                     "codex": self._unavailable("codex", "refresh_unavailable"),
                     "claude": self._unavailable("claude", "refresh_unavailable"),
@@ -465,7 +466,10 @@ class UsageService:
             observation = read_json(self.claude_path)
             if observation is not None and isinstance(observation.get("observed_at"), int):
                 passive = normalize_claude_payload(observation, observed_at=observation["observed_at"])
-                del passive["credits"]
+                # A passive status-line observation carries allowance only, so omitting
+                # credits here lets merge_refresh_result preserve/age the prior live
+                # credit observation instead of collapsing it to "unsupported".
+                passive.pop("credits", None)
                 claude = merge_refresh_result(
                     previous_providers.get("claude"), passive, now,
                     credit_unit="currency", credit_error_code=_credit_error_code(error),
