@@ -307,9 +307,8 @@ function CreditsSection({ providerId, credits }) {
               }),
               jsx('div', {
                 className: 'text-foreground',
-                children: monthly.reached
-                  ? `${monthly.used}/${monthly.limit} credits · Reached`
-                  : `${monthly.used}/${monthly.limit} credits · ${percent(monthly.remainingPercent)} remaining`
+                children: `${monthly.used}/${monthly.limit} credits · ${percent(monthly.remainingPercent)} remaining` +
+                  (monthly.reached ? ' · Reached' : '')
               }),
               jsx('div', {
                 className: 'text-[0.6875rem] text-(--ui-text-tertiary)',

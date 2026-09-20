@@ -527,7 +527,7 @@ class DesktopCreditsSectionRenderTests(unittest.TestCase):
         self.assertTrue(any("8" in t and "10" in t and "20%" in t for t in texts), texts)
         self.assertFalse(any("$" in t for t in texts))
 
-    def test_monthly_row_marks_reached_when_spend_control_is_reached(self) -> None:
+    def test_monthly_row_marks_reached_while_still_retaining_all_required_fields(self) -> None:
         credits = codex_credits(
             balance={"available": True, "amount_credits": "9.5", "unlimited": False},
             spend={"used_credits": "10", "limit_credits": "10", "remaining_percent": 0.0, "resets_at": 6500},
@@ -535,7 +535,15 @@ class DesktopCreditsSectionRenderTests(unittest.TestCase):
         )
         tree = self.render("codex", credits)
         texts = collect_text(tree)
-        self.assertTrue(any("Reached" in t for t in texts), texts)
+        # The reached row must still visibly include every required field: used
+        # amount, limit amount, the existing percent()-formatted remaining
+        # percentage, and the Reached marker, all in one row (not dropped).
+        matching = [t for t in texts if "10/10" in t and "0% remaining" in t and "Reached" in t]
+        self.assertEqual(len(matching), 1, texts)
+        # The reset time line (the monthly row's last child in document order)
+        # must still render, unaffected by the Reached marker.
+        self.assertNotEqual(texts[-1], "Reset unavailable", texts)
+        self.assertNotEqual(texts[-1], matching[0])
 
     def test_no_monthly_row_without_spend(self) -> None:
         credits = codex_credits(balance={"available": True, "amount_credits": "9.5", "unlimited": False},
