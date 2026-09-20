@@ -232,7 +232,7 @@ class ClaudeOAuthUsageTests(unittest.TestCase):
             provider = fetch_claude_rate_limits(100)
         self.assertEqual(provider["credits"]["status"], "current")
 
-    def test_401_403_429_timeout_and_invalid_body_use_safe_errors(self) -> None:
+    def test_401_403_429_and_timeout_use_safe_errors(self) -> None:
         class ResponseError(RuntimeError):
             def __init__(self, status_code: int) -> None:
                 super().__init__("provider body containing secret-value")
@@ -405,10 +405,7 @@ class UsageServiceTests(unittest.TestCase):
                     request_json=lambda *_args: {
                         "five_hour": {"utilization": 0.0, "resets_at": "2026-09-20T01:00:00Z"},
                         "seven_day": {"utilization": 1.0, "resets_at": "2026-09-25T01:00:00Z"},
-                        "extra_usage": {
-                            "is_enabled": True, "used_credits": 1840, "monthly_limit": 10000,
-                            "currency": "USD", "decimal_places": 2,
-                        },
+                        "extra_usage": None,
                     },
                 )
 
@@ -429,6 +426,10 @@ class UsageServiceTests(unittest.TestCase):
                 [window["remaining_percent"] for window in claude["windows"]],
                 [100.0, 0.0],
             )
+            credits = claude["credits"]
+            self.assertEqual(credits["status"], "unavailable")
+            self.assertIsNone(credits["observed_at"])
+            self.assertIsNone(credits["source"])
 
             cache_text = (data_dir / "usage-cache.json").read_text(encoding="utf-8")
             self.assertNotIn("oauth-secret-token", cache_text)
@@ -561,14 +562,19 @@ class CacheAdmissionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
             (data_dir / "usage-cache.json").write_text(json.dumps(snapshot), encoding="utf-8")
+            codex_calls: list[None] = []
+            claude_calls: list[int] = []
             service = UsageService(
                 data_dir,
-                codex_fetcher=lambda: self.fail("codex_fetcher must not be called"),
-                claude_fetcher=lambda _observed_at: self.fail("claude_fetcher must not be called"),
+                codex_fetcher=lambda: codex_calls.append(None) or codex_result(),
+                claude_fetcher=lambda observed_at: claude_calls.append(observed_at) or normalized_claude(observed_at),
                 now=lambda: 100,
                 auth_checker=authenticated,
             )
-            return service._read_cache()
+            result = service._read_cache()
+            self.assertEqual(codex_calls, [])
+            self.assertEqual(claude_calls, [])
+            return result
 
     def test_valid_schema_v2_snapshot_is_admitted(self) -> None:
         self.assertIsNotNone(self._read_cache_for(self.valid_snapshot()))
@@ -718,10 +724,12 @@ class CreditServiceTests(unittest.TestCase):
             data_dir = Path(directory)
             write_schema_two_cache(data_dir, generated_at=995, credit_observed_at=99,
                                     credit_freshness="stale")
+            codex_calls: list[None] = []
+            claude_calls: list[int] = []
             service = UsageService(
                 data_dir,
-                codex_fetcher=lambda: self.fail("codex_fetcher must not be called"),
-                claude_fetcher=lambda _observed_at: self.fail("claude_fetcher must not be called"),
+                codex_fetcher=lambda: codex_calls.append(None) or codex_result(),
+                claude_fetcher=lambda observed_at: claude_calls.append(observed_at) or normalized_claude(observed_at),
                 now=lambda: 1000,
                 auth_checker=authenticated,
             )
@@ -731,6 +739,8 @@ class CreditServiceTests(unittest.TestCase):
             self.assertEqual(credits["status"], "unavailable")
             self.assertIsNone(credits["observed_at"])
             self.assertIsNone(credits["source"])
+            self.assertEqual(codex_calls, [])
+            self.assertEqual(claude_calls, [])
 
     def test_concurrent_refresh_owner_generated_at_survives_aging_race(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -775,6 +785,7 @@ class CreditServiceTests(unittest.TestCase):
             data_dir = Path(directory)
             gate = threading.Event()
             started = threading.Event()
+            waiting = threading.Event()
             now_box = [100]
 
             def slow_codex_fetcher() -> dict:
@@ -794,6 +805,18 @@ class CreditServiceTests(unittest.TestCase):
             owner_thread.start()
             self.assertTrue(started.wait(timeout=1))
 
+            # Wrap the owner's in-flight event so we can observe the waiter actually
+            # parking inside done.wait() before releasing the owner: a deterministic
+            # barrier instead of a timing-only sleep between thread starts.
+            owner_event = service._refresh_done
+            original_wait = owner_event.wait
+
+            def observed_wait(timeout: float | None = None) -> bool:
+                waiting.set()
+                return original_wait(timeout)
+
+            owner_event.wait = observed_wait
+
             # Simulate wall-clock time passing while the waiter is parked in done.wait():
             # the owner captured now=100 before it ever blocked, but by the time the
             # waiter is released it must judge freshness using its own current clock.
@@ -804,6 +827,7 @@ class CreditServiceTests(unittest.TestCase):
                 target=lambda: waiter_result.update(snapshot=service.refresh())
             )
             waiter_thread.start()
+            self.assertTrue(waiting.wait(timeout=1))
 
             gate.set()
             owner_thread.join(timeout=2)
@@ -817,10 +841,12 @@ class CreditServiceTests(unittest.TestCase):
     def test_waiter_wait_budget_covers_both_provider_timeouts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
+            codex_calls: list[None] = []
+            claude_calls: list[int] = []
             service = UsageService(
                 data_dir,
-                codex_fetcher=lambda: self.fail("codex_fetcher must not be called"),
-                claude_fetcher=lambda _observed_at: self.fail("claude_fetcher must not be called"),
+                codex_fetcher=lambda: codex_calls.append(None) or codex_result(),
+                claude_fetcher=lambda observed_at: claude_calls.append(observed_at) or normalized_claude(observed_at),
                 now=lambda: 100,
                 auth_checker=authenticated,
             )
@@ -838,6 +864,8 @@ class CreditServiceTests(unittest.TestCase):
             service.refresh()
 
             self.assertEqual(captured["timeout"], CODEX_TIMEOUT_SECONDS + CLAUDE_TIMEOUT_SECONDS + 5)
+            self.assertEqual(codex_calls, [])
+            self.assertEqual(claude_calls, [])
 
 
 if __name__ == "__main__":
