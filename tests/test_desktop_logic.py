@@ -349,6 +349,20 @@ class DesktopCreditLogicTests(unittest.TestCase):
         self.assertTrue(presentation["consequential"])
 
 
+class DesktopRefreshFailureTests(unittest.TestCase):
+    def test_refresh_usage_applies_only_a_successful_result(self) -> None:
+        result = call_helper("refreshUsage", {"$resolve": {"mode": "refreshed"}})
+        self.assertEqual(result, {"ok": True})
+
+    def test_refresh_usage_swallows_rejection_without_an_unhandled_promise(self) -> None:
+        # If refreshUsage let the rejection propagate, the harness's own
+        # `await helper(...)` at the top level would reject unhandled, Node
+        # would exit non-zero, and this call_helper() would raise
+        # CalledProcessError instead of returning a value.
+        result = call_helper("refreshUsage", {"$reject": "network down"})
+        self.assertEqual(result, {"ok": False})
+
+
 class DesktopFixtureTests(unittest.TestCase):
     def test_fixture_matrix_is_schema_v2_and_secret_free_and_helper_safe(self) -> None:
         fixtures = json.loads(FIXTURES.read_text(encoding="utf-8"))

@@ -33,6 +33,20 @@ function useUsage() {
   })
 }
 
+// A failed refresh must keep whatever safe query data is already cached and
+// must never let its rejection reach the caller unhandled, so the request and
+// its outcome are isolated here: apply the result only on success, and always
+// resolve.
+async function refreshUsage(requestRefresh) {
+  try {
+    const next = await requestRefresh()
+    queryClient.setQueryData(QUERY_KEY, next)
+    return { ok: true }
+  } catch (_error) {
+    return { ok: false }
+  }
+}
+
 function percent(value) {
   return Number.isFinite(value) ? `${Math.round(value)}%` : '—'
 }
@@ -386,8 +400,7 @@ function ProviderMenu({ providerId }) {
     if (refreshing) return
     setRefreshing(true)
     try {
-      const next = await call('/refresh', { method: 'POST' })
-      queryClient.setQueryData(QUERY_KEY, next)
+      await refreshUsage(() => call('/refresh', { method: 'POST' }))
     } finally {
       setRefreshing(false)
     }
@@ -462,4 +475,4 @@ export default {
   }
 }
 
-export { compactLabel, creditPresentation, formatCurrencyMinor, selectCompactAllowance }
+export { compactLabel, creditPresentation, formatCurrencyMinor, refreshUsage, selectCompactAllowance }

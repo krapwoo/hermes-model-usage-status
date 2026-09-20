@@ -104,6 +104,19 @@ class DesktopPluginContractTests(unittest.TestCase):
         self.assertIn("creditPresentation", source)
         self.assertLess(source.index("jsx(CreditsSection"), source.index("provider?.source"))
 
+    def test_refresh_failure_is_caught_and_never_overwrites_cached_data(self) -> None:
+        source = PLUGIN.read_text(encoding="utf-8")
+        self.assertIn("async function refreshUsage(requestRefresh)", source)
+        helper = source[source.index("async function refreshUsage("):]
+        helper = helper[:helper.index("\n}\n") + 2]
+        # setQueryData must only ever run on the success path, before the catch.
+        self.assertLess(helper.index("queryClient.setQueryData"), helper.index("catch"))
+        self.assertIn("return { ok: false }", helper)
+        # refresh() must still disable/re-enable Refresh via finally, and must
+        # never let refreshUsage's promise reach the caller unhandled.
+        self.assertIn("await refreshUsage(", source)
+        self.assertIn("finally {\n      setRefreshing(false)\n    }", source)
+
 
 if __name__ == "__main__":
     unittest.main()

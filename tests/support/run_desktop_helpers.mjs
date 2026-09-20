@@ -35,9 +35,24 @@ await plugin.link(async specifier => {
 })
 await plugin.evaluate()
 
+// A JSON request cannot carry a live JS function, so a callback-shaped argument
+// is described declaratively (`{"$resolve": value}` / `{"$reject": message}`)
+// and revived here into an actual function that returns a settled promise.
+function reviveArgs(args) {
+  return args.map(arg => {
+    if (arg && typeof arg === 'object' && '$resolve' in arg) {
+      return () => Promise.resolve(arg.$resolve)
+    }
+    if (arg && typeof arg === 'object' && '$reject' in arg) {
+      return () => Promise.reject(new Error(arg.$reject))
+    }
+    return arg
+  })
+}
+
 let serialized = ''
 for await (const chunk of process.stdin) serialized += chunk
 const request = JSON.parse(serialized)
 const helper = plugin.namespace[request.function]
 if (typeof helper !== 'function') throw new Error(`Unknown helper: ${request.function}`)
-process.stdout.write(JSON.stringify(helper(...request.args)))
+process.stdout.write(JSON.stringify(await helper(...reviveArgs(request.args))))
