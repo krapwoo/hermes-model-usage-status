@@ -15,8 +15,10 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from model_usage_status.claude_snapshot import default_output_path, record_observation  # noqa: E402
+from model_usage_status.core import normalize_claude_oauth_result, normalize_codex_result  # noqa: E402
 from model_usage_status.service import (  # noqa: E402
     ClaudeAuthenticationRequired,
+    ProviderUsageUnavailable,
     UsageService,
     authentication_status,
     fetch_claude_rate_limits,
@@ -32,7 +34,7 @@ def authenticated(_provider: str) -> dict:
     return dict(AUTHENTICATED)
 
 
-def unavailable_claude() -> dict:
+def unavailable_claude(_observed_at: int) -> dict:
     raise RuntimeError("claude_usage_unavailable")
 
 
@@ -49,6 +51,44 @@ def codex_result(used: int = 57) -> dict:
         },
         "rateLimitsByLimitId": {},
     }
+
+
+def normalized_claude(observed_at: int) -> dict:
+    return normalize_claude_oauth_result({
+        "five_hour": {"utilization": 0.1, "resets_at": "2026-09-20T01:00:00Z"},
+        "seven_day": {"utilization": 0.2, "resets_at": "2026-09-25T01:00:00Z"},
+        "extra_usage": {
+            "is_enabled": True, "used_credits": 1840, "monthly_limit": 10000,
+            "currency": "USD", "decimal_places": 2,
+        },
+    }, observed_at)
+
+
+def write_passive_observation(data_dir: Path, observed_at: int) -> None:
+    (data_dir / "claude-observation.json").write_text(json.dumps({
+        "schema_version": 1,
+        "provider": "claude",
+        "observed_at": observed_at,
+        "activity_marker": "fixture",
+        "observation_source": "status_line",
+        "rate_limits": {
+            "five_hour": {"used_percentage": 10, "resets_at": 2000},
+            "seven_day": {"used_percentage": 20, "resets_at": 3000},
+        },
+    }), encoding="utf-8")
+
+
+def write_schema_two_cache(data_dir: Path, *, generated_at: int,
+                           credit_observed_at: int,
+                           credit_freshness: str) -> None:
+    claude = normalized_claude(credit_observed_at)
+    claude["credits"]["freshness"] = credit_freshness
+    codex = normalize_codex_result(codex_result(), observed_at=credit_observed_at)
+    (data_dir / "usage-cache.json").write_text(json.dumps({
+        "schema_version": 2,
+        "generated_at": generated_at,
+        "providers": {"claude": claude, "codex": codex},
+    }), encoding="utf-8")
 
 
 class CodexProtocolTests(unittest.TestCase):
@@ -145,26 +185,97 @@ class ClaudeSnapshotTests(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), before)
 
 
-class ProviderAuthenticationTests(unittest.TestCase):
-    def test_oauth_usage_rejection_requires_reauthentication(self) -> None:
-        class UsageRejected(RuntimeError):
-            response = SimpleNamespace(status_code=401)
+class ClaudeOAuthUsageTests(unittest.TestCase):
+    def payload(self) -> dict:
+        return {
+            "five_hour": {"utilization": 0.1, "resets_at": "2026-09-20T01:00:00Z"},
+            "seven_day": {"utilization": 0.2, "resets_at": "2026-09-25T01:00:00Z"},
+            "extra_usage": {
+                "is_enabled": True, "used_credits": 1840, "monthly_limit": 10000,
+                "currency": "USD", "decimal_places": 2,
+            },
+        }
 
-        error = UsageRejected("provider rejected credentials")
+    def test_one_oauth_request_returns_only_normalized_provider_state(self) -> None:
+        calls = []
 
-        with patch("agent.account_usage._fetch_anthropic_account_usage", side_effect=error):
-            with self.assertRaises(ClaudeAuthenticationRequired):
-                fetch_claude_rate_limits()
+        def request_json(url: str, headers: dict, timeout: float) -> dict:
+            calls.append((url, headers, timeout))
+            return self.payload()
 
-    def test_expired_stored_oauth_without_a_usage_response_requires_reauthentication(self) -> None:
+        provider = fetch_claude_rate_limits(
+            100,
+            token_resolver=lambda: "oauth-secret-token",
+            oauth_checker=lambda token: token == "oauth-secret-token",
+            request_json=request_json,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "https://api.anthropic.com/api/oauth/usage")
+        self.assertEqual(calls[0][2], 15.0)
+        self.assertEqual(calls[0][1]["Authorization"], "Bearer oauth-secret-token")
+        serialized = json.dumps(provider)
+        self.assertNotIn("oauth-secret-token", serialized)
+        self.assertNotIn("extra_usage", serialized)
+        self.assertEqual(provider["credits"]["spend"]["used_minor"], 1840)
+
+    def test_default_path_imports_the_installed_hermes_credential_resolver(self) -> None:
         with (
-            patch("agent.account_usage._fetch_anthropic_account_usage", return_value=None),
-            patch("agent.anthropic_credentials.read_claude_code_credentials", return_value={"expiresAt": 1}),
-            patch("agent.anthropic_credentials.is_claude_code_token_valid", return_value=False),
+            patch("agent.anthropic_credentials.resolve_anthropic_token",
+                  return_value="oauth-secret-token"),
+            patch("agent.anthropic_credentials._is_oauth_token", return_value=True),
+            patch("model_usage_status.service._claude_request_json",
+                  return_value=self.payload()),
         ):
-            with self.assertRaises(ClaudeAuthenticationRequired):
-                fetch_claude_rate_limits()
+            provider = fetch_claude_rate_limits(100)
+        self.assertEqual(provider["credits"]["status"], "current")
 
+    def test_401_403_429_timeout_and_invalid_body_use_safe_errors(self) -> None:
+        class ResponseError(RuntimeError):
+            def __init__(self, status_code: int) -> None:
+                super().__init__("provider body containing secret-value")
+                self.response = SimpleNamespace(status_code=status_code)
+
+        for error, expected in (
+            (ResponseError(401), ClaudeAuthenticationRequired),
+            (ResponseError(403), ClaudeAuthenticationRequired),
+            (ResponseError(429), ProviderUsageUnavailable),
+            (TimeoutError("secret-value"), ProviderUsageUnavailable),
+        ):
+            with self.subTest(error=type(error).__name__):
+                with self.assertRaises(expected) as raised:
+                    fetch_claude_rate_limits(
+                        100,
+                        token_resolver=lambda: "oauth-secret-token",
+                        oauth_checker=lambda _token: True,
+                        request_json=lambda *_args: (_ for _ in ()).throw(error),
+                    )
+                self.assertNotIn("secret-value", str(raised.exception))
+
+    def test_missing_or_non_oauth_token_is_unsupported(self) -> None:
+        def must_not_request(*_args: object) -> dict:
+            self.fail("request_json must not be called without a usable token")
+
+        with self.assertRaises(ProviderUsageUnavailable) as raised:
+            fetch_claude_rate_limits(
+                100,
+                token_resolver=lambda: None,
+                oauth_checker=lambda _token: True,
+                request_json=must_not_request,
+            )
+        self.assertEqual(raised.exception.credit_error_code, "unsupported")
+
+        with self.assertRaises(ProviderUsageUnavailable) as raised:
+            fetch_claude_rate_limits(
+                100,
+                token_resolver=lambda: "sk-ant-api-not-oauth",
+                oauth_checker=lambda _token: False,
+                request_json=must_not_request,
+            )
+        self.assertEqual(raised.exception.credit_error_code, "unsupported")
+
+
+class ProviderAuthenticationTests(unittest.TestCase):
     def test_successful_status_is_authenticated_without_action(self) -> None:
         result = authentication_status(
             "claude",
@@ -241,7 +352,7 @@ class ProviderAuthenticationTests(unittest.TestCase):
 class UsageServiceTests(unittest.TestCase):
     def test_oauth_rejection_overrides_a_false_healthy_cli_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            def rejected() -> dict:
+            def rejected(_observed_at: int) -> dict:
                 raise ClaudeAuthenticationRequired("claude_authentication_required")
 
             service = UsageService(
@@ -275,13 +386,11 @@ class UsageServiceTests(unittest.TestCase):
             service = UsageService(
                 Path(directory),
                 codex_fetcher=lambda: codex_result(),
-                claude_fetcher=lambda: {
-                    "observation_source": "usage",
-                    "rate_limits": {
-                        "five_hour": {"used_percentage": 0, "resets_at": 2000},
-                        "seven_day": {"used_percentage": 100, "resets_at": 3000},
-                    },
-                },
+                claude_fetcher=lambda observed_at: normalize_claude_oauth_result({
+                    "five_hour": {"utilization": 0.0, "resets_at": "2026-09-20T01:00:00Z"},
+                    "seven_day": {"utilization": 1.0, "resets_at": "2026-09-25T01:00:00Z"},
+                    "extra_usage": None,
+                }, observed_at),
                 now=lambda: 1000,
                 auth_checker=authenticated,
             )
@@ -290,7 +399,7 @@ class UsageServiceTests(unittest.TestCase):
 
             claude = snapshot["providers"]["claude"]
             self.assertEqual(claude["status"], "current")
-            self.assertEqual(claude["source"], "Claude Code /usage")
+            self.assertEqual(claude["source"], "claude-oauth-usage")
             self.assertEqual(
                 [window["remaining_percent"] for window in claude["windows"]],
                 [100.0, 0.0],
@@ -405,6 +514,188 @@ class UsageServiceTests(unittest.TestCase):
 
             self.assertEqual(calls, 1)
             self.assertEqual(len(results), 2)
+
+
+class CacheAdmissionTests(unittest.TestCase):
+    def valid_snapshot(self) -> dict:
+        return {
+            "schema_version": 2,
+            "generated_at": 100,
+            "providers": {
+                "claude": normalized_claude(100),
+                "codex": normalize_codex_result(codex_result(), observed_at=100),
+            },
+        }
+
+    def _read_cache_for(self, snapshot: dict):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            (data_dir / "usage-cache.json").write_text(json.dumps(snapshot), encoding="utf-8")
+            service = UsageService(data_dir, now=lambda: 100, auth_checker=authenticated)
+            return service._read_cache()
+
+    def test_valid_schema_v2_snapshot_is_admitted(self) -> None:
+        self.assertIsNotNone(self._read_cache_for(self.valid_snapshot()))
+
+    def test_provider_id_mismatch_or_wrong_type_is_rejected(self) -> None:
+        for bad_id in (["claude"], {"id": "claude"}, "codex", None):
+            with self.subTest(bad_id=bad_id):
+                snapshot = self.valid_snapshot()
+                snapshot["providers"]["claude"]["id"] = bad_id
+                self.assertIsNone(self._read_cache_for(snapshot))
+
+    def test_provider_credits_not_a_dict_is_rejected(self) -> None:
+        for bad_credits in (None, "current", ["current"], 42):
+            with self.subTest(bad_credits=bad_credits):
+                snapshot = self.valid_snapshot()
+                snapshot["providers"]["codex"]["credits"] = bad_credits
+                self.assertIsNone(self._read_cache_for(snapshot))
+
+    def test_credit_unit_unhashable_or_non_canonical_is_rejected(self) -> None:
+        for provider_id, bad_unit in (
+            ("claude", "credits"), ("codex", "currency"), ("codex", ["credits"]),
+        ):
+            with self.subTest(provider_id=provider_id, bad_unit=bad_unit):
+                snapshot = self.valid_snapshot()
+                snapshot["providers"][provider_id]["credits"]["unit"] = bad_unit
+                self.assertIsNone(self._read_cache_for(snapshot))
+
+    def test_credit_block_missing_required_key_is_rejected(self) -> None:
+        for missing_key in ("status", "observed_at", "error_code", "unit", "freshness"):
+            with self.subTest(missing_key=missing_key):
+                snapshot = self.valid_snapshot()
+                del snapshot["providers"]["claude"]["credits"][missing_key]
+                self.assertIsNone(self._read_cache_for(snapshot))
+
+    def test_provider_container_not_a_dict_is_rejected(self) -> None:
+        for bad_provider in (["claude"], "claude", 1, None):
+            with self.subTest(bad_provider=bad_provider):
+                snapshot = self.valid_snapshot()
+                snapshot["providers"]["claude"] = bad_provider
+                self.assertIsNone(self._read_cache_for(snapshot))
+
+    def test_invalid_cache_forces_get_to_refresh_with_canonical_unavailable_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            snapshot = self.valid_snapshot()
+            snapshot["providers"]["claude"]["id"] = ["claude"]
+            (data_dir / "usage-cache.json").write_text(json.dumps(snapshot), encoding="utf-8")
+            calls = []
+            service = UsageService(
+                data_dir,
+                codex_fetcher=lambda: calls.append("codex") or codex_result(),
+                claude_fetcher=lambda _observed_at: (_ for _ in ()).throw(
+                    ProviderUsageUnavailable("provider_unavailable")
+                ),
+                now=lambda: 200,
+                auth_checker=authenticated,
+            )
+
+            result = service.get()
+
+            self.assertEqual(calls, ["codex"])
+            self.assertEqual(result["providers"]["claude"]["status"], "unavailable")
+            self.assertIsNone(result["providers"]["claude"]["observed_at"])
+            self.assertEqual(result["schema_version"], 2)
+
+
+class CreditServiceTests(unittest.TestCase):
+    def test_legacy_cache_forces_refresh_and_schema_two_is_written(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            (data_dir / "usage-cache.json").write_text(json.dumps({
+                "schema_version": 1, "generated_at": 999,
+                "providers": {},
+            }), encoding="utf-8")
+            calls = []
+            service = UsageService(
+                data_dir,
+                codex_fetcher=lambda: calls.append("codex") or codex_result(),
+                claude_fetcher=lambda observed_at: normalized_claude(observed_at),
+                now=lambda: 1000,
+                auth_checker=authenticated,
+            )
+
+            result = service.get()
+
+            self.assertEqual(calls, ["codex"])
+            self.assertEqual(result["schema_version"], 2)
+            self.assertEqual(json.loads((data_dir / "usage-cache.json").read_text())["schema_version"], 2)
+
+    def test_passive_allowance_fallback_cannot_refresh_credits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            now = [100]
+            service = UsageService(
+                data_dir,
+                codex_fetcher=lambda: codex_result(),
+                claude_fetcher=lambda observed_at: normalized_claude(observed_at),
+                now=lambda: now[0],
+                auth_checker=authenticated,
+            )
+            service.refresh()
+            now[0] = 200
+            service.claude_fetcher = lambda _observed_at: (_ for _ in ()).throw(
+                ProviderUsageUnavailable("timeout")
+            )
+            write_passive_observation(data_dir, observed_at=200)
+
+            second = service.refresh()
+
+            self.assertEqual(second["providers"]["claude"]["windows"][0]["remaining_percent"], 90.0)
+            self.assertEqual(second["providers"]["claude"]["credits"]["freshness"], "stale")
+            self.assertEqual(second["providers"]["claude"]["credits"]["observed_at"], 100)
+
+    def test_stale_credit_expires_on_cached_read_without_waiting_for_cache_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            write_schema_two_cache(data_dir, generated_at=995, credit_observed_at=99,
+                                    credit_freshness="stale")
+            service = UsageService(data_dir, now=lambda: 1000, auth_checker=authenticated)
+
+            credits = service.get()["providers"]["claude"]["credits"]
+
+            self.assertEqual(credits["status"], "unavailable")
+            self.assertIsNone(credits["observed_at"])
+            self.assertIsNone(credits["source"])
+
+    def test_concurrent_refresh_owner_generated_at_survives_aging_race(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            write_schema_two_cache(data_dir, generated_at=750, credit_observed_at=1,
+                                    credit_freshness="current")
+            gate = threading.Event()
+            started = threading.Event()
+
+            def slow_codex_fetcher() -> dict:
+                started.set()
+                gate.wait(timeout=2)
+                return codex_result()
+
+            service = UsageService(
+                data_dir,
+                codex_fetcher=slow_codex_fetcher,
+                claude_fetcher=lambda observed_at: normalized_claude(observed_at),
+                now=lambda: 1000,
+                auth_checker=authenticated,
+            )
+
+            owner_result: dict = {}
+            owner_thread = threading.Thread(
+                target=lambda: owner_result.update(snapshot=service.refresh())
+            )
+            owner_thread.start()
+            self.assertTrue(started.wait(timeout=1))
+
+            reader_view = service.get()
+
+            gate.set()
+            owner_thread.join(timeout=2)
+
+            self.assertEqual(owner_result["snapshot"]["generated_at"], 1000)
+            on_disk = json.loads((data_dir / "usage-cache.json").read_text())
+            self.assertEqual(on_disk["generated_at"], 1000)
+            self.assertEqual(reader_view["providers"]["claude"]["credits"]["status"], "unavailable")
 
 
 if __name__ == "__main__":
