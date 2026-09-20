@@ -87,13 +87,21 @@ function creditIsConsequential(credits) {
 const UNAVAILABLE_CREDIT_PRESENTATION = {
   primary: 'Unavailable', supporting: null, monthly: null, compact: null, consequential: false
 }
-const OFF_CREDIT_PRESENTATION = {
-  primary: 'Off', supporting: null, monthly: null, compact: null, consequential: false
-}
+const CLAUDE_OFF_SUPPORT = 'Paid extra usage is not enabled.'
+const CODEX_OFF_SUPPORT = 'Credit-backed usage is not available'
+const CODEX_HIDDEN_BALANCE_SUPPORT = 'The provider did not return a balance'
 
 function creditPresentation(providerId, credits, locale) {
   if (!credits || typeof credits !== 'object') return UNAVAILABLE_CREDIT_PRESENTATION
-  if (credits.status === 'off') return OFF_CREDIT_PRESENTATION
+  const stale = credits.freshness === 'stale'
+
+  if (credits.status === 'off') {
+    return {
+      primary: stale ? 'Off · stale' : 'Off',
+      supporting: providerId === 'claude' ? CLAUDE_OFF_SUPPORT : CODEX_OFF_SUPPORT,
+      monthly: null, compact: null, consequential: false
+    }
+  }
   if (credits.status !== 'current') return UNAVAILABLE_CREDIT_PRESENTATION
 
   const consequential = creditIsConsequential(credits)
@@ -104,17 +112,24 @@ function creditPresentation(providerId, credits, locale) {
       return UNAVAILABLE_CREDIT_PRESENTATION
     }
     const remainingMinor = Math.max(spend.limit_minor - spend.used_minor, 0)
-    const remaining = formatCurrencyMinor(remainingMinor, currency, scale, locale)
     const used = formatCurrencyMinor(spend.used_minor, currency, scale, locale)
     const limit = formatCurrencyMinor(spend.limit_minor, currency, scale, locale)
-    if (remaining === null || used === null || limit === null) return UNAVAILABLE_CREDIT_PRESENTATION
+    const remaining = formatCurrencyMinor(remainingMinor, currency, scale, locale)
+    if (used === null || limit === null || remaining === null) return UNAVAILABLE_CREDIT_PRESENTATION
 
     const qualifier = credits.exhausted ? 'Exhausted' : credits.low ? 'Low' : null
-    const primary = qualifier ? `${remaining} left · ${qualifier}` : `${remaining} left`
+    const primaryBase = `${used} of ${limit} used`
+    const primaryText = qualifier ? `${primaryBase} · ${qualifier}` : primaryBase
     const compactBase = `Credits ${used}/${limit}`
     const compact = qualifier ? `${compactBase} · ${qualifier}` : compactBase
 
-    return { primary, supporting: null, monthly: `${limit} monthly limit`, compact, consequential }
+    return {
+      primary: stale ? `${primaryText} · stale` : primaryText,
+      supporting: `${remaining} remains this month`,
+      monthly: null,
+      compact,
+      consequential
+    }
   }
 
   if (credits.unit === 'credits') {
@@ -127,10 +142,15 @@ function creditPresentation(providerId, credits, locale) {
       base = `${balance.amount_credits} credits left`
     } else if (balance && balance.available) {
       base = 'Available'
-      supporting = 'Exact balance not shown by the provider.'
+      supporting = CODEX_HIDDEN_BALANCE_SUPPORT
     }
 
-    const monthlyQualified = !base || Boolean(spend)
+    // A numeric zero balance is independently exhausted; the monthly-limit wording
+    // is reserved for when the qualifier actually derives from `spend` while a
+    // nonzero/hidden/unlimited balance is shown, or when no balance exists at all.
+    const isZeroBalance = Boolean(balance) && balance.amount_credits != null &&
+      Number(balance.amount_credits) === 0
+    const monthlyQualified = isZeroBalance ? false : (!base || Boolean(spend))
     const qualifier = credits.exhausted
       ? (monthlyQualified ? 'Monthly limit reached' : 'Exhausted')
       : credits.low
@@ -148,9 +168,23 @@ function creditPresentation(providerId, credits, locale) {
       return UNAVAILABLE_CREDIT_PRESENTATION
     }
 
-    const monthly = spend && spend.limit_credits != null ? `${spend.limit_credits} credits monthly limit` : null
+    // The monthly row always truthfully reports the spend object's own state,
+    // independent of which wording the primary/compact qualifier used above.
+    const monthly = spend ? {
+      used: spend.used_credits,
+      limit: spend.limit_credits,
+      remainingPercent: spend.remaining_percent,
+      resetsAt: spend.resets_at,
+      reached: Number.isFinite(spend.remaining_percent) && spend.remaining_percent <= 0
+    } : null
 
-    return { primary: text, supporting, monthly, compact: text, consequential }
+    return {
+      primary: stale ? `${text} · stale` : text,
+      supporting,
+      monthly,
+      compact: text,
+      consequential
+    }
   }
 
   return UNAVAILABLE_CREDIT_PRESENTATION
@@ -239,7 +273,7 @@ function WindowRow({ window }) {
 function CreditsSection({ providerId, credits }) {
   const presentation = creditPresentation(providerId, credits)
   const stale = credits?.freshness === 'stale'
-  const supportingText = stale ? age(credits.observed_at) : presentation.supporting
+  const monthly = presentation.monthly
 
   return jsxs('div', {
     className: 'border-t border-(--ui-stroke-secondary) pt-2',
@@ -249,14 +283,41 @@ function CreditsSection({ providerId, credits }) {
         className: 'space-y-2',
         children: [
           jsx('div', { className: 'text-foreground', children: presentation.primary }),
-          supportingText
-            ? jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-tertiary)', children: supportingText })
+          presentation.supporting
+            ? jsx('div', {
+                className: 'text-[0.6875rem] text-(--ui-text-tertiary)',
+                children: presentation.supporting
+              })
             : null,
-          presentation.monthly
-            ? jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-tertiary)', children: presentation.monthly })
+          stale
+            ? jsx('div', {
+                className: 'text-[0.6875rem] text-(--ui-text-tertiary)',
+                children: age(credits.observed_at)
+              })
             : null
         ]
-      })
+      }),
+      monthly
+        ? jsxs('div', {
+            className: 'border-t border-(--ui-stroke-secondary) pt-2',
+            children: [
+              jsx('div', {
+                className: 'pb-1 font-medium text-(--ui-text-secondary)',
+                children: 'Monthly credit limit'
+              }),
+              jsx('div', {
+                className: 'text-foreground',
+                children: monthly.reached
+                  ? `${monthly.used}/${monthly.limit} credits · Reached`
+                  : `${monthly.used}/${monthly.limit} credits · ${percent(monthly.remainingPercent)} remaining`
+              }),
+              jsx('div', {
+                className: 'text-[0.6875rem] text-(--ui-text-tertiary)',
+                children: dateTime(monthly.resetsAt)
+              })
+            ]
+          })
+        : null
     ]
   })
 }
@@ -475,4 +536,4 @@ export default {
   }
 }
 
-export { compactLabel, creditPresentation, formatCurrencyMinor, refreshUsage, selectCompactAllowance }
+export { CreditsSection, compactLabel, creditPresentation, formatCurrencyMinor, refreshUsage, selectCompactAllowance }

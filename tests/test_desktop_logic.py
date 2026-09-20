@@ -63,6 +63,37 @@ def codex_credits(*, balance=None, spend=None, active, low, exhausted,
     }
 
 
+def collect_text(node) -> list[str]:
+    """Recursively collect every string leaf from a serialized {type, props, key}
+    JSX-stub tree (as produced by the Node VM harness), in document order."""
+    texts: list[str] = []
+    if isinstance(node, str):
+        texts.append(node)
+    elif isinstance(node, dict):
+        children = node.get("props", {}).get("children") if isinstance(node.get("props"), dict) else None
+        if isinstance(children, list):
+            for child in children:
+                texts.extend(collect_text(child))
+        elif children is not None:
+            texts.extend(collect_text(children))
+    return texts
+
+
+def collect_types(node) -> list:
+    """Recursively collect every node `type` value from a serialized JSX-stub tree."""
+    types: list = []
+    if isinstance(node, dict):
+        if "type" in node:
+            types.append(node["type"])
+        children = node.get("props", {}).get("children") if isinstance(node.get("props"), dict) else None
+        if isinstance(children, list):
+            for child in children:
+                types.extend(collect_types(child))
+        elif isinstance(children, dict):
+            types.extend(collect_types(children))
+    return types
+
+
 class DesktopCreditLogicTests(unittest.TestCase):
     def test_currency_scale_is_provider_reported_and_exact(self) -> None:
         self.assertEqual(call_helper("formatCurrencyMinor", 1840, "USD", 2, "en-US"), "$18.40")
@@ -166,46 +197,49 @@ class DesktopCreditLogicTests(unittest.TestCase):
                     "compact": None, "consequential": False,
                 })
 
-    # --- Claude currency states ---
+    # --- Claude currency states: exact spec oracles (design doc lines 245-257) ---
 
-    def test_claude_zero_spend_is_current_but_not_consequential(self) -> None:
+    def test_claude_enabled_zero_spend_matches_the_approved_oracle(self) -> None:
         credits = claude_credits(0, 10000, active=False, low=False, exhausted=False)
         presentation = call_helper("creditPresentation", "claude", credits, "en-US")
         self.assertEqual(presentation, {
-            "primary": "$100 left", "supporting": None, "monthly": "$100 monthly limit",
+            "primary": "$0 of $100 used", "supporting": "$100 remains this month", "monthly": None,
             "compact": "Credits $0/$100", "consequential": False,
         })
 
-    def test_claude_active_spend_is_consequential(self) -> None:
+    def test_claude_active_matches_the_approved_oracle(self) -> None:
         credits = claude_credits(1840, 10000, active=True, low=False, exhausted=False)
         presentation = call_helper("creditPresentation", "claude", credits, "en-US")
         self.assertEqual(presentation, {
-            "primary": "$81.60 left", "supporting": None, "monthly": "$100 monthly limit",
+            "primary": "$18.40 of $100 used", "supporting": "$81.60 remains this month", "monthly": None,
             "compact": "Credits $18.40/$100", "consequential": True,
         })
 
-    def test_claude_low_qualifies_the_fact_not_a_new_fact(self) -> None:
+    def test_claude_low_matches_the_approved_oracle(self) -> None:
         credits = claude_credits(8500, 10000, active=True, low=True, exhausted=False)
         presentation = call_helper("creditPresentation", "claude", credits, "en-US")
-        self.assertEqual(presentation["primary"], "$15 left · Low")
+        self.assertEqual(presentation["primary"], "$85 of $100 used · Low")
+        self.assertEqual(presentation["supporting"], "$15 remains this month")
         self.assertEqual(presentation["compact"], "Credits $85/$100 · Low")
         self.assertTrue(presentation["consequential"])
 
-    def test_claude_exhausted_suppresses_low(self) -> None:
+    def test_claude_exhausted_matches_the_approved_oracle_and_suppresses_low(self) -> None:
         credits = claude_credits(10000, 10000, active=True, low=True, exhausted=True)
         presentation = call_helper("creditPresentation", "claude", credits, "en-US")
-        self.assertEqual(presentation["primary"], "$0 left · Exhausted")
+        self.assertEqual(presentation["primary"], "$100 of $100 used · Exhausted")
+        self.assertEqual(presentation["supporting"], "$0 remains this month")
         self.assertEqual(presentation["compact"], "Credits $100/$100 · Exhausted")
         self.assertNotIn("Low", presentation["primary"])
         self.assertNotIn("Low", presentation["compact"])
 
-    def test_claude_over_cap_clamps_remaining_to_zero_and_is_exhausted(self) -> None:
+    def test_claude_over_cap_matches_the_approved_oracle(self) -> None:
         credits = claude_credits(12000, 10000, active=True, low=True, exhausted=True)
         presentation = call_helper("creditPresentation", "claude", credits, "en-US")
-        self.assertEqual(presentation["primary"], "$0 left · Exhausted")
+        self.assertEqual(presentation["primary"], "$120 of $100 used · Exhausted")
+        self.assertEqual(presentation["supporting"], "$0 remains this month")
         self.assertEqual(presentation["compact"], "Credits $120/$100 · Exhausted")
 
-    def test_claude_off_never_shows_a_number(self) -> None:
+    def test_claude_off_uses_the_approved_support_copy(self) -> None:
         credits = {
             "status": "off", "freshness": "current", "unit": "currency",
             "currency": None, "minor_unit_scale": None, "balance": None, "spend": None,
@@ -214,20 +248,57 @@ class DesktopCreditLogicTests(unittest.TestCase):
         }
         presentation = call_helper("creditPresentation", "claude", credits, "en-US")
         self.assertEqual(presentation, {
-            "primary": "Off", "supporting": None, "monthly": None,
+            "primary": "Off", "supporting": "Paid extra usage is not enabled.", "monthly": None,
             "compact": None, "consequential": False,
         })
 
-    def test_claude_stale_credit_is_unchanged_by_presentation_but_labeled_by_compact(self) -> None:
+    def test_claude_stale_appends_stale_to_primary_exactly_once(self) -> None:
         credits = claude_credits(1840, 10000, active=True, low=False, exhausted=False, freshness="stale")
         presentation = call_helper("creditPresentation", "claude", credits, "en-US")
-        self.assertEqual(presentation["primary"], "$81.60 left")
+        self.assertEqual(presentation["primary"], "$18.40 of $100 used · stale")
+        self.assertEqual(presentation["primary"].count(" · stale"), 1)
+        self.assertEqual(presentation["supporting"], "$81.60 remains this month")
+        self.assertNotIn(" · stale", presentation["compact"])
         provider = {"status": "current", "windows": [
             {"label": "5h", "duration_minutes": 300, "remaining_percent": 90},
             {"label": "Week", "duration_minutes": 10080, "remaining_percent": 80},
         ], "model_limits": [], "credits": credits}
         label = call_helper("compactLabel", "claude", provider, "en-US")
+        self.assertEqual(label.count(" · stale"), 1)
         self.assertTrue(label.endswith(" · stale"), label)
+
+    def test_claude_stale_off_matches_the_approved_oracle(self) -> None:
+        credits = {
+            "status": "off", "freshness": "stale", "unit": "currency",
+            "currency": None, "minor_unit_scale": None, "balance": None, "spend": None,
+            "active": False, "low": False, "exhausted": False,
+            "observed_at": 100, "source": "claude-oauth-usage", "error_code": None,
+        }
+        presentation = call_helper("creditPresentation", "claude", credits, "en-US")
+        self.assertEqual(presentation["primary"], "Off · stale")
+        self.assertEqual(presentation["supporting"], "Paid extra usage is not enabled.")
+
+    def test_claude_amounts_agree_between_label_and_popover_at_usd_scale_3(self) -> None:
+        credits = claude_credits(18400, 100000, active=True, low=False, exhausted=False, scale=3)
+        presentation = call_helper("creditPresentation", "claude", credits, "en-US")
+        self.assertEqual(presentation["primary"], "$18.400 of $100 used")
+        self.assertEqual(presentation["supporting"], "$81.600 remains this month")
+        self.assertEqual(presentation["compact"], "Credits $18.400/$100")
+        provider = {"status": "current", "windows": [], "model_limits": [], "credits": credits}
+        label = call_helper("compactLabel", "claude", provider, "en-US")
+        self.assertIn(presentation["compact"], label)
+
+    def test_claude_amounts_agree_between_label_and_popover_for_a_non_usd_scale(self) -> None:
+        # JPY's own standard minor-unit scale is 0, but the provider reports scale 2 here;
+        # the renderer must use the provider-reported scale, never the currency's default.
+        credits = claude_credits(1840, 10000, active=True, low=False, exhausted=False, currency="JPY")
+        presentation = call_helper("creditPresentation", "claude", credits, "en-US")
+        self.assertEqual(presentation["primary"], "¥18.40 of ¥100 used")
+        self.assertEqual(presentation["supporting"], "¥81.60 remains this month")
+        self.assertEqual(presentation["compact"], "Credits ¥18.40/¥100")
+        provider = {"status": "current", "windows": [], "model_limits": [], "credits": credits}
+        label = call_helper("compactLabel", "claude", provider, "en-US")
+        self.assertIn(presentation["compact"], label)
 
     def test_claude_unavailable_credits_never_enter_compact_label(self) -> None:
         provider = {
@@ -281,17 +352,36 @@ class DesktopCreditLogicTests(unittest.TestCase):
         presentation = call_helper("creditPresentation", "codex", credits, "en-US")
         self.assertEqual(presentation["primary"], "0 credits left · Exhausted")
         self.assertEqual(presentation["compact"], "0 credits left · Exhausted")
+        self.assertIsNone(presentation["monthly"])
         self.assertTrue(presentation["consequential"])
 
-    def test_codex_hidden_balance_shows_available_with_support_copy(self) -> None:
+    def test_codex_zero_balance_with_unreached_monthly_limit_stays_plain_exhausted(self) -> None:
+        # A numeric zero balance is independently exhausted even though the separate
+        # monthly spend limit still has remaining headroom; the qualifier must not
+        # borrow "Monthly limit" wording it did not earn, and the monthly row must
+        # truthfully report its own unreached values.
+        credits = codex_credits(
+            balance={"available": True, "amount_credits": "0", "unlimited": False},
+            spend={"used_credits": "5", "limit_credits": "10", "remaining_percent": 50.0, "resets_at": 6500},
+            active=False, low=False, exhausted=True,
+        )
+        presentation = call_helper("creditPresentation", "codex", credits, "en-US")
+        self.assertEqual(presentation["primary"], "0 credits left · Exhausted")
+        self.assertEqual(presentation["compact"], "0 credits left · Exhausted")
+        self.assertNotIn("Monthly limit", presentation["primary"])
+        self.assertEqual(presentation["monthly"], {
+            "used": "5", "limit": "10", "remainingPercent": 50.0, "resetsAt": 6500, "reached": False,
+        })
+
+    def test_codex_hidden_balance_uses_the_approved_support_copy(self) -> None:
         credits = codex_credits(balance={"available": True, "amount_credits": None, "unlimited": False},
                                  active=False, low=False, exhausted=False)
         presentation = call_helper("creditPresentation", "codex", credits, "en-US")
         self.assertEqual(presentation["primary"], "Available")
-        self.assertIsNotNone(presentation["supporting"])
+        self.assertEqual(presentation["supporting"], "The provider did not return a balance")
         self.assertFalse(presentation["consequential"])
 
-    def test_codex_off_never_shows_a_number(self) -> None:
+    def test_codex_off_uses_the_approved_support_copy(self) -> None:
         credits = {
             "status": "off", "freshness": "current", "unit": "credits",
             "currency": None, "minor_unit_scale": None, "balance": None, "spend": None,
@@ -300,17 +390,42 @@ class DesktopCreditLogicTests(unittest.TestCase):
         }
         presentation = call_helper("creditPresentation", "codex", credits, "en-US")
         self.assertEqual(presentation, {
-            "primary": "Off", "supporting": None, "monthly": None,
+            "primary": "Off", "supporting": "Credit-backed usage is not available", "monthly": None,
             "compact": None, "consequential": False,
         })
 
-    def test_codex_stale_is_unchanged_by_presentation_but_labeled_by_compact(self) -> None:
+    def test_codex_stale_off_matches_the_approved_oracle(self) -> None:
+        credits = {
+            "status": "off", "freshness": "stale", "unit": "credits",
+            "currency": None, "minor_unit_scale": None, "balance": None, "spend": None,
+            "active": False, "low": False, "exhausted": False,
+            "observed_at": 100, "source": "codex-app-server", "error_code": None,
+        }
+        presentation = call_helper("creditPresentation", "codex", credits, "en-US")
+        self.assertEqual(presentation["primary"], "Off · stale")
+        self.assertEqual(presentation["supporting"], "Credit-backed usage is not available")
+
+    def test_codex_stale_hidden_balance_retains_its_support_copy(self) -> None:
+        # A stale hidden-balance state must keep its own explanation; the age line is
+        # additional, never a replacement for provider-specific supporting copy.
+        credits = codex_credits(balance={"available": True, "amount_credits": None, "unlimited": False},
+                                 active=False, low=False, exhausted=False, freshness="stale")
+        presentation = call_helper("creditPresentation", "codex", credits, "en-US")
+        self.assertEqual(presentation["primary"], "Available · stale")
+        self.assertEqual(presentation["supporting"], "The provider did not return a balance")
+
+    def test_codex_stale_appends_stale_to_primary_exactly_once(self) -> None:
         credits = codex_credits(balance={"available": True, "amount_credits": "9.5", "unlimited": False},
                                  active=True, low=False, exhausted=False, freshness="stale")
+        presentation = call_helper("creditPresentation", "codex", credits, "en-US")
+        self.assertEqual(presentation["primary"], "9.5 credits left · stale")
+        self.assertEqual(presentation["primary"].count(" · stale"), 1)
+        self.assertNotIn(" · stale", presentation["compact"])
         provider = {"status": "current",
                     "windows": [{"label": "Week", "duration_minutes": 10080, "remaining_percent": 80}],
                     "model_limits": [], "credits": credits}
         label = call_helper("compactLabel", "codex", provider, "en-US")
+        self.assertEqual(label.count(" · stale"), 1)
         self.assertTrue(label.endswith(" · stale"), label)
 
     def test_codex_unavailable_credits_never_enter_compact_label(self) -> None:
@@ -322,7 +437,7 @@ class DesktopCreditLogicTests(unittest.TestCase):
         }
         self.assertEqual(call_helper("compactLabel", "codex", provider, "en-US"), "Codex Week 80%")
 
-    def test_codex_monthly_low_with_balance(self) -> None:
+    def test_codex_monthly_low_with_balance_exposes_the_controlling_spend_values(self) -> None:
         credits = codex_credits(
             balance={"available": True, "amount_credits": "9.5", "unlimited": False},
             spend={"used_credits": "8", "limit_credits": "10", "remaining_percent": 20.0, "resets_at": 6500},
@@ -330,9 +445,11 @@ class DesktopCreditLogicTests(unittest.TestCase):
         )
         presentation = call_helper("creditPresentation", "codex", credits, "en-US")
         self.assertEqual(presentation["primary"], "9.5 credits left · Monthly limit low")
-        self.assertEqual(presentation["monthly"], "10 credits monthly limit")
+        self.assertEqual(presentation["monthly"], {
+            "used": "8", "limit": "10", "remainingPercent": 20.0, "resetsAt": 6500, "reached": False,
+        })
 
-    def test_codex_monthly_reached_with_balance(self) -> None:
+    def test_codex_monthly_reached_with_balance_keeps_the_truthful_balance(self) -> None:
         credits = codex_credits(
             balance={"available": True, "amount_credits": "9.5", "unlimited": False},
             spend={"used_credits": "10", "limit_credits": "10", "remaining_percent": 0.0, "resets_at": 6500},
@@ -341,11 +458,15 @@ class DesktopCreditLogicTests(unittest.TestCase):
         presentation = call_helper("creditPresentation", "codex", credits, "en-US")
         self.assertEqual(presentation["primary"], "9.5 credits left · Monthly limit reached")
         self.assertNotIn("Low", presentation["primary"])
+        self.assertEqual(presentation["monthly"], {
+            "used": "10", "limit": "10", "remainingPercent": 0.0, "resetsAt": 6500, "reached": True,
+        })
 
     def test_codex_monthly_reached_without_any_balance(self) -> None:
         credits = codex_credits(balance=None, spend=None, active=True, low=False, exhausted=True)
         presentation = call_helper("creditPresentation", "codex", credits, "en-US")
         self.assertEqual(presentation["primary"], "Monthly limit reached")
+        self.assertIsNone(presentation["monthly"])
         self.assertTrue(presentation["consequential"])
 
 
@@ -361,6 +482,80 @@ class DesktopRefreshFailureTests(unittest.TestCase):
         # CalledProcessError instead of returning a value.
         result = call_helper("refreshUsage", {"$reject": "network down"})
         self.assertEqual(result, {"ok": False})
+
+
+class DesktopCreditsSectionRenderTests(unittest.TestCase):
+    def render(self, provider_id: str, credits) -> dict:
+        return call_helper("CreditsSection", {"providerId": provider_id, "credits": credits})
+
+    def test_section_title_and_active_primary_render(self) -> None:
+        tree = self.render("claude", claude_credits(1840, 10000, active=True, low=False, exhausted=False))
+        texts = collect_text(tree)
+        self.assertIn("Credits", texts)
+        self.assertIn("$18.40 of $100 used", texts)
+        self.assertIn("$81.60 remains this month", texts)
+        self.assertFalse(any("progress" in str(t).lower() for t in collect_types(tree)))
+
+    def test_stale_primary_and_supporting_and_age_all_appear(self) -> None:
+        credits = codex_credits(
+            balance={"available": True, "amount_credits": None, "unlimited": False},
+            active=False, low=False, exhausted=False, freshness="stale",
+        )
+        credits["observed_at"] = 100  # far in the past: deterministically "Observed <N>d ago"
+        tree = self.render("codex", credits)
+        texts = collect_text(tree)
+        self.assertIn("Available · stale", texts)
+        self.assertIn("The provider did not return a balance", texts)
+        age_lines = [text for text in texts if text.startswith("Observed ")]
+        self.assertEqual(len(age_lines), 1, texts)
+        self.assertRegex(age_lines[0], r"^Observed \d+d ago$")
+
+    def test_non_stale_state_has_no_age_line(self) -> None:
+        tree = self.render("claude", claude_credits(1840, 10000, active=True, low=False, exhausted=False))
+        texts = collect_text(tree)
+        self.assertFalse(any(text.startswith("Observed ") for text in texts))
+
+    def test_monthly_row_label_and_content_render_with_native_units(self) -> None:
+        credits = codex_credits(
+            balance={"available": True, "amount_credits": "9.5", "unlimited": False},
+            spend={"used_credits": "8", "limit_credits": "10", "remaining_percent": 20.0, "resets_at": 6500},
+            active=True, low=True, exhausted=False,
+        )
+        tree = self.render("codex", credits)
+        texts = collect_text(tree)
+        self.assertIn("Monthly credit limit", texts)
+        self.assertTrue(any("8" in t and "10" in t and "20%" in t for t in texts), texts)
+        self.assertFalse(any("$" in t for t in texts))
+
+    def test_monthly_row_marks_reached_when_spend_control_is_reached(self) -> None:
+        credits = codex_credits(
+            balance={"available": True, "amount_credits": "9.5", "unlimited": False},
+            spend={"used_credits": "10", "limit_credits": "10", "remaining_percent": 0.0, "resets_at": 6500},
+            active=True, low=True, exhausted=True,
+        )
+        tree = self.render("codex", credits)
+        texts = collect_text(tree)
+        self.assertTrue(any("Reached" in t for t in texts), texts)
+
+    def test_no_monthly_row_without_spend(self) -> None:
+        credits = codex_credits(balance={"available": True, "amount_credits": "9.5", "unlimited": False},
+                                 active=True, low=False, exhausted=False)
+        tree = self.render("codex", credits)
+        texts = collect_text(tree)
+        self.assertNotIn("Monthly credit limit", texts)
+
+    def test_no_progress_component_anywhere_in_the_tree(self) -> None:
+        for provider_id, credits in (
+            ("claude", claude_credits(8500, 10000, active=True, low=True, exhausted=False)),
+            ("codex", codex_credits(
+                balance={"available": True, "amount_credits": "9.5", "unlimited": False},
+                spend={"used_credits": "8", "limit_credits": "10", "remaining_percent": 20.0, "resets_at": 6500},
+                active=True, low=True, exhausted=False)),
+        ):
+            with self.subTest(provider_id=provider_id):
+                tree = self.render(provider_id, credits)
+                for node_type in collect_types(tree):
+                    self.assertNotIn("progress", str(node_type).lower())
 
 
 class DesktopFixtureTests(unittest.TestCase):
