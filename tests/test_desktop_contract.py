@@ -83,6 +83,17 @@ class DesktopPluginContractTests(unittest.TestCase):
         self.assertIn("method: 'POST'", source)
         self.assertIn("queryClient.invalidateQueries({ queryKey: QUERY_KEY })", source)
 
+    def test_every_backend_call_is_pinned_to_the_local_primary_backend(self) -> None:
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        # Usage must read the same local machine/account state no matter which
+        # Hermes profile or remote connection the desktop window is on. One
+        # shared `call()` helper injects the target so /usage, /refresh, and
+        # /authentication/<provider> all resolve local-primary uniformly.
+        self.assertIn("function call(path, options)", source)
+        self.assertEqual(source.count("target: 'local-primary'"), 1)
+        self.assertRegex(source, r"rest\(path,\s*\{\s*\.\.\.options,\s*target:\s*'local-primary'\s*\}\)")
+
     def test_manifest_entry_is_present_in_public_source(self) -> None:
         entry = PLUGIN.parents[1] / "dashboard" / "dist" / "index.js"
 

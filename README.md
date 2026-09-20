@@ -34,6 +34,8 @@ The installer:
 4. Adds Claude's passive status-line observer as a fallback while preserving unrelated Claude settings.
 5. Removes only an obsolete standalone Desktop copy of this same plugin, if present.
 
+Running the installer (or uninstaller) from a standard named Hermes profile home still installs/enables (or removes/disables) the plugin in your primary/default `~/.hermes` home, since the Desktop status bar is app-global, not per-profile.
+
 Then restart the Hermes backend and reload Hermes Desktop plugins (`⌘K` → **Reload desktop plugins**) or restart Hermes Desktop.
 
 Right-click the status bar to show or hide **Claude model usage** and **Codex model usage** independently. Selecting either status item opens a menu that stays available while you use **Refresh** or, when required, **Reauthenticate**.

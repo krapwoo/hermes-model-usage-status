@@ -34,6 +34,19 @@ class InstallerError(RuntimeError):
     pass
 
 
+def _resolve_primary_hermes_home(hermes_home: Path) -> Path:
+    """A standard named-profile home (`.../.hermes/profiles/<name>`) installs
+    into the primary `.../.hermes` home instead of the profile itself: usage
+    is local machine/account state, not per-profile data, so the plugin and
+    its `hermes plugins` CLI calls must resolve one shared home regardless of
+    which profile invoked the installer. A custom/nonstandard HERMES_HOME
+    (not shaped like a profile path) is returned unchanged."""
+    parent = hermes_home.parent
+    if parent.name == "profiles" and parent.parent.name == ".hermes":
+        return parent.parent
+    return hermes_home
+
+
 def _status_line_command(snapshot_path: Path) -> str:
     return " ".join(("python3", shlex.quote(str(snapshot_path))))
 
@@ -113,9 +126,9 @@ def _copy_distribution(source: Path, destination: Path) -> None:
         shutil.copy2(origin, target)
 
 
-def _checked_run(runner: Callable[..., Any], args: list[str], error_code: str) -> None:
+def _checked_run(runner: Callable[..., Any], args: list[str], error_code: str, *, env: dict[str, str]) -> None:
     try:
-        result = runner(args, capture_output=True, check=False, text=True)
+        result = runner(args, capture_output=True, check=False, text=True, env=env)
     except OSError as error:
         raise InstallerError(error_code) from error
     if result.returncode != 0:
@@ -131,15 +144,18 @@ def install(
     dry_run: bool = False,
 ) -> dict[str, str]:
     source = Path(source).resolve()
-    hermes_home = Path(hermes_home).expanduser().resolve()
+    hermes_home = _resolve_primary_hermes_home(Path(hermes_home).expanduser().resolve())
     claude_config_dir = Path(claude_config_dir).expanduser().resolve()
     target = hermes_home / "plugins" / PLUGIN_ID
     settings_path = claude_config_dir / "settings.json"
     command = _status_line_command(target / "model_usage_status" / "claude_snapshot.py")
+    subprocess_env = {**os.environ, "HERMES_HOME": str(hermes_home)}
 
     settings, original_settings = _read_settings(settings_path)
     updated_settings = _prepare_settings(settings, command)
-    _checked_run(runner, ["hermes", "plugins", "validate", str(source)], "plugin_validation_failed")
+    _checked_run(
+        runner, ["hermes", "plugins", "validate", str(source)], "plugin_validation_failed", env=subprocess_env
+    )
     if dry_run:
         return {"status": "validated", "target": str(target)}
 
@@ -160,6 +176,7 @@ def install(
             runner,
             ["hermes", "plugins", "enable", PLUGIN_ID, "--no-allow-tool-override"],
             "plugin_enable_failed",
+            env=subprocess_env,
         )
     except Exception:
         if target.exists():

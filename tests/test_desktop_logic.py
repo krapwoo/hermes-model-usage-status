@@ -132,6 +132,40 @@ class DesktopCreditLogicTests(unittest.TestCase):
         malformed = [{"label": "5h", "duration_minutes": 300, "remaining_percent": "not-a-number"}]
         self.assertIsNone(call_helper("selectCompactAllowance", malformed))
 
+    def test_compact_label_falls_back_to_lowest_remaining_percent_for_arbitrary_durations(self) -> None:
+        # Neither 10080 nor 300 is present; the fallback must still surface the
+        # controlling (lowest remaining) window rather than dropping it silently.
+        provider = {
+            "status": "current",
+            "windows": [
+                {"label": "Daily", "duration_minutes": 1440, "remaining_percent": 65},
+                {"label": "Hourly", "duration_minutes": 60, "remaining_percent": 30},
+            ],
+            "model_limits": [],
+            "credits": codex_credits(
+                balance={"available": True, "amount_credits": "9", "unlimited": False},
+                active=True, low=False, exhausted=False,
+            ),
+        }
+        self.assertEqual(call_helper("compactLabel", "codex", provider, "en-US"),
+                         "Codex Hourly 30% · 9 credits left")
+
+    def test_compact_label_falls_back_to_lowest_remaining_percent_including_null_duration(self) -> None:
+        provider = {
+            "status": "current",
+            "windows": [
+                {"label": "Unknown", "duration_minutes": None, "remaining_percent": 10},
+                {"label": "Daily", "duration_minutes": 1440, "remaining_percent": 50},
+            ],
+            "model_limits": [],
+            "credits": codex_credits(
+                balance={"available": True, "amount_credits": "9", "unlimited": False},
+                active=True, low=False, exhausted=False,
+            ),
+        }
+        self.assertEqual(call_helper("compactLabel", "codex", provider, "en-US"),
+                         "Codex Unknown 10% · 9 credits left")
+
     def test_compact_labels_never_exceed_allowance_plus_credit_summary(self) -> None:
         provider = {
             "status": "current",
@@ -165,9 +199,30 @@ class DesktopCreditLogicTests(unittest.TestCase):
             "observed_at": 100, "source": "codex-app-server", "error_code": None,
         }
         presentation = call_helper("creditPresentation", "codex", credits, "en-US")
-        self.assertEqual(presentation["primary"], "9.5 credits left")
-        self.assertEqual(presentation["compact"], "9.5 credits left")
+        self.assertEqual(presentation["primary"], "10 credits left")
+        self.assertEqual(presentation["compact"], "10 credits left")
         self.assertNotIn("$", json.dumps(presentation))
+
+    def test_codex_decimal_heavy_balance_renders_as_locale_formatted_whole_credits(self) -> None:
+        credits = codex_credits(
+            balance={"available": True, "amount_credits": "1234.567891", "unlimited": False},
+            active=True, low=False, exhausted=False,
+        )
+        presentation = call_helper("creditPresentation", "codex", credits, "en-US")
+        self.assertEqual(presentation["primary"], "1,235 credits left")
+        self.assertEqual(presentation["compact"], "1,235 credits left")
+        self.assertNotIn(".", presentation["primary"])
+
+    def test_codex_sub_one_positive_balance_never_renders_as_zero(self) -> None:
+        credits = codex_credits(
+            balance={"available": True, "amount_credits": "0.4", "unlimited": False},
+            active=True, low=False, exhausted=False,
+        )
+        presentation = call_helper("creditPresentation", "codex", credits, "en-US")
+        self.assertEqual(presentation["primary"], "Less than 1 credit left")
+        self.assertEqual(presentation["compact"], "Less than 1 credit left")
+        self.assertNotIn(".", presentation["primary"])
+        self.assertNotIn("0 credits", presentation["primary"])
 
     def test_stale_exhausted_codex_balance_remains_consequential_without_active(self) -> None:
         provider = {
@@ -418,7 +473,7 @@ class DesktopCreditLogicTests(unittest.TestCase):
         credits = codex_credits(balance={"available": True, "amount_credits": "9.5", "unlimited": False},
                                  active=True, low=False, exhausted=False, freshness="stale")
         presentation = call_helper("creditPresentation", "codex", credits, "en-US")
-        self.assertEqual(presentation["primary"], "9.5 credits left · stale")
+        self.assertEqual(presentation["primary"], "10 credits left · stale")
         self.assertEqual(presentation["primary"].count(" · stale"), 1)
         self.assertNotIn(" · stale", presentation["compact"])
         provider = {"status": "current",
@@ -444,7 +499,7 @@ class DesktopCreditLogicTests(unittest.TestCase):
             active=True, low=True, exhausted=False,
         )
         presentation = call_helper("creditPresentation", "codex", credits, "en-US")
-        self.assertEqual(presentation["primary"], "9.5 credits left · Monthly limit low")
+        self.assertEqual(presentation["primary"], "10 credits left · Monthly limit low")
         self.assertEqual(presentation["monthly"], {
             "used": "8", "limit": "10", "remainingPercent": 20.0, "resetsAt": 6500, "reached": False,
         })
@@ -456,7 +511,7 @@ class DesktopCreditLogicTests(unittest.TestCase):
             active=True, low=True, exhausted=True,
         )
         presentation = call_helper("creditPresentation", "codex", credits, "en-US")
-        self.assertEqual(presentation["primary"], "9.5 credits left · Monthly limit reached")
+        self.assertEqual(presentation["primary"], "10 credits left · Monthly limit reached")
         self.assertNotIn("Low", presentation["primary"])
         self.assertEqual(presentation["monthly"], {
             "used": "10", "limit": "10", "remainingPercent": 0.0, "resetsAt": 6500, "reached": True,

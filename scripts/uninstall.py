@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
-from scripts.install import PLUGIN_ID, _is_our_status_line
+from scripts.install import PLUGIN_ID, _is_our_status_line, _resolve_primary_hermes_home
 
 
 def _write_settings(path: Path, value: dict[str, Any]) -> None:
@@ -34,7 +34,7 @@ def uninstall(
     claude_config_dir: Path,
     runner: Callable[..., Any] = subprocess.run,
 ) -> dict[str, str]:
-    hermes_home = Path(hermes_home).expanduser().resolve()
+    hermes_home = _resolve_primary_hermes_home(Path(hermes_home).expanduser().resolve())
     claude_config_dir = Path(claude_config_dir).expanduser().resolve()
     try:
         runner(
@@ -42,6 +42,7 @@ def uninstall(
             capture_output=True,
             check=False,
             text=True,
+            env={**os.environ, "HERMES_HOME": str(hermes_home)},
         )
     except OSError:
         pass

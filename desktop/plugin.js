@@ -21,7 +21,12 @@ function bindRest(value) {
 }
 
 function call(path, options) {
-  return rest ? rest(path, options) : Promise.reject(new Error('model usage API unavailable'))
+  // Usage is local machine/account state, not per-profile or per-connection
+  // data — every call must read the local backend's primary state regardless
+  // of which Hermes profile or remote connection the desktop window is on.
+  return rest
+    ? rest(path, { ...options, target: 'local-primary' })
+    : Promise.reject(new Error('model usage API unavailable'))
 }
 
 function useUsage() {
@@ -65,18 +70,29 @@ function formatCurrencyMinor(amountMinor, currency, scale, locale) {
   }).format(amountMinor / divisor)
 }
 
+function formatWholeCredits(amountCredits, locale) {
+  const numeric = Number(amountCredits)
+  if (!Number.isFinite(numeric) || numeric < 0) return null
+  return new Intl.NumberFormat(locale ? [locale] : [], { maximumFractionDigits: 0 }).format(numeric)
+}
+
 function selectCompactAllowance(windows) {
   const valid = (Array.isArray(windows) ? windows : []).filter(
-    window => Number.isFinite(window?.remaining_percent) &&
-      (window.duration_minutes === 300 || window.duration_minutes === 10080)
+    window => Number.isFinite(window?.remaining_percent)
   )
   const weekly = valid.find(window => window.duration_minutes === 10080)
   const short = valid.find(window => window.duration_minutes === 300)
   if (weekly?.remaining_percent === 0) return weekly
   if (short?.remaining_percent === 0) return short
-  if (!short) return weekly || null
-  if (!weekly) return short
-  return weekly.remaining_percent <= short.remaining_percent ? weekly : short
+  if (weekly && short) return weekly.remaining_percent <= short.remaining_percent ? weekly : short
+  if (weekly) return weekly
+  if (short) return short
+  // Neither preferred duration is present (arbitrary or null durations only):
+  // fall back to whichever valid window has the lowest remaining percentage.
+  return valid.reduce(
+    (lowest, window) => (!lowest || window.remaining_percent < lowest.remaining_percent ? window : lowest),
+    null
+  )
 }
 
 function creditIsConsequential(credits) {
@@ -139,7 +155,13 @@ function creditPresentation(providerId, credits, locale) {
     if (balance && balance.unlimited) {
       base = 'Unlimited'
     } else if (balance && balance.amount_credits != null) {
-      base = `${balance.amount_credits} credits left`
+      const numericAmount = Number(balance.amount_credits)
+      if (Number.isFinite(numericAmount) && numericAmount > 0 && numericAmount < 1) {
+        base = 'Less than 1 credit left'
+      } else {
+        const whole = formatWholeCredits(balance.amount_credits, locale)
+        base = whole !== null ? `${whole} credits left` : null
+      }
     } else if (balance && balance.available) {
       base = 'Available'
       supporting = CODEX_HIDDEN_BALANCE_SUPPORT
