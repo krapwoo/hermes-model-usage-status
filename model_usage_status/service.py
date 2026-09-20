@@ -30,6 +30,10 @@ CODEX_TIMEOUT_SECONDS = 20
 AUTH_TIMEOUT_SECONDS = 10
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_TIMEOUT_SECONDS = 15.0
+# REQ-FLOW-1: a waiter may need to outlast the owner's initial pass plus one
+# coalesced follow-up pass, so the wait budget covers two full sequential
+# Codex+Claude passes (each already margined by +5) plus an extra cushion.
+REFRESH_WAIT_TIMEOUT_SECONDS = 2 * (CODEX_TIMEOUT_SECONDS + CLAUDE_TIMEOUT_SECONDS + 5) + 10
 
 _AUTH_PROVIDERS = {
     "claude": {"status": ("auth", "status", "--text"), "login": ("auth", "login")},
@@ -456,7 +460,7 @@ class UsageService:
                 is_owner = True
 
         if not is_owner:
-            done.wait(timeout=CODEX_TIMEOUT_SECONDS + CLAUDE_TIMEOUT_SECONDS + 5)
+            done.wait(timeout=REFRESH_WAIT_TIMEOUT_SECONDS)
             return self._with_authentication(self._read_cache_or_empty_aged())
 
         try:

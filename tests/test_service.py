@@ -19,6 +19,7 @@ from model_usage_status.core import normalize_claude_oauth_result, normalize_cod
 from model_usage_status.service import (  # noqa: E402
     CLAUDE_TIMEOUT_SECONDS,
     CODEX_TIMEOUT_SECONDS,
+    REFRESH_WAIT_TIMEOUT_SECONDS,
     ClaudeAuthenticationRequired,
     ProviderUsageUnavailable,
     UsageService,
@@ -554,6 +555,29 @@ def _capture_error(callable_, errors: list[Exception]) -> None:
         errors.append(error)
 
 
+class _SequencedClock:
+    """A thread-safe fake monotonic clock that serves a fixed sequence of
+    values under a lock, then repeats its last value indefinitely instead of
+    raising StopIteration inside a worker thread. Tests that care about the
+    exact number of samples should assert on ``call_count`` explicitly."""
+
+    def __init__(self, *values: float) -> None:
+        self._values = list(values)
+        self._lock = threading.Lock()
+        self._next_index = 0
+
+    def __call__(self) -> float:
+        with self._lock:
+            index = min(self._next_index, len(self._values) - 1)
+            self._next_index += 1
+            return self._values[index]
+
+    @property
+    def call_count(self) -> int:
+        with self._lock:
+            return self._next_index
+
+
 class RefreshOwnershipTests(unittest.TestCase):
     def test_newer_manual_requests_coalesce_into_one_follow_up(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -562,7 +586,7 @@ class RefreshOwnershipTests(unittest.TestCase):
             release_first = threading.Event()
             followup_started = threading.Event()
             release_followup = threading.Event()
-            ticks = iter([10.0, 20.0, 21.0, 30.0])
+            clock = _SequencedClock(10.0, 20.0, 21.0, 30.0)
 
             def codex_fetcher() -> dict:
                 nonlocal calls
@@ -578,7 +602,7 @@ class RefreshOwnershipTests(unittest.TestCase):
             service = UsageService(
                 Path(directory), codex_fetcher=codex_fetcher,
                 claude_fetcher=lambda observed_at: normalized_claude(observed_at),
-                now=lambda: 1000, monotonic=lambda: next(ticks),
+                now=lambda: 1000, monotonic=clock,
                 auth_checker=authenticated,
             )
             results = []
@@ -613,6 +637,11 @@ class RefreshOwnershipTests(unittest.TestCase):
             self.assertEqual(calls, 2)
             self.assertEqual(len(results), 3)
             self.assertTrue(all(result["generated_at"] == 1000 for result in results))
+            self.assertEqual(
+                clock.call_count, 4,
+                "expected exactly 4 monotonic() samples: owner start, the two "
+                "manual requests, and one coalesced follow-up owner restart",
+            )
 
     def test_manual_request_with_equal_timestamp_accepts_owner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -660,6 +689,7 @@ class RefreshOwnershipTests(unittest.TestCase):
             )
             started = threading.Event()
             release = threading.Event()
+            waiting = threading.Event()
 
             def fail_once() -> dict:
                 started.set()
@@ -668,16 +698,35 @@ class RefreshOwnershipTests(unittest.TestCase):
 
             service._refresh_once = fail_once
             owner_errors: list[Exception] = []
+            waiter_errors: list[Exception] = []
             owner = threading.Thread(target=lambda: _capture_error(service.refresh, owner_errors))
-            waiter = threading.Thread(target=service.refresh)
             owner.start()
             self.assertTrue(started.wait(timeout=1))
+
+            # Wrap the owner's in-flight event so we can observe the waiter actually
+            # parking on done.wait() before releasing the owner: the same
+            # deterministic barrier pattern used by the aging/coalescing tests,
+            # not a timing-only sleep.
+            owner_event = service._refresh_done
+            original_wait = owner_event.wait
+
+            def observed_wait(timeout: float | None = None) -> bool:
+                waiting.set()
+                return original_wait(timeout)
+
+            owner_event.wait = observed_wait
+
+            waiter = threading.Thread(target=lambda: _capture_error(service.refresh, waiter_errors))
             waiter.start()
+            self.assertTrue(waiting.wait(timeout=1))
+
             release.set()
             owner.join(timeout=2)
             waiter.join(timeout=2)
+
             self.assertFalse(waiter.is_alive())
             self.assertEqual(len(owner_errors), 1)
+            self.assertEqual(waiter_errors, [])
 
     def test_stale_owner_token_cannot_deregister_a_new_owner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -986,7 +1035,7 @@ class CreditServiceTests(unittest.TestCase):
             self.assertIsNone(credits["observed_at"])
             self.assertIsNone(credits["source"])
 
-    def test_waiter_wait_budget_covers_both_provider_timeouts(self) -> None:
+    def test_waiter_wait_budget_covers_two_full_provider_passes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
             codex_calls: list[None] = []
@@ -1011,7 +1060,15 @@ class CreditServiceTests(unittest.TestCase):
 
             service.refresh()
 
-            self.assertEqual(captured["timeout"], CODEX_TIMEOUT_SECONDS + CLAUDE_TIMEOUT_SECONDS + 5)
+            # A waiter may need to outlast the owner's initial pass plus one
+            # REQ-FLOW-1 coalesced follow-up pass, so the budget must cover two
+            # full Codex+Claude passes, not just one.
+            self.assertGreaterEqual(REFRESH_WAIT_TIMEOUT_SECONDS, 90)
+            self.assertEqual(
+                REFRESH_WAIT_TIMEOUT_SECONDS,
+                2 * (CODEX_TIMEOUT_SECONDS + CLAUDE_TIMEOUT_SECONDS + 5) + 10,
+            )
+            self.assertEqual(captured["timeout"], REFRESH_WAIT_TIMEOUT_SECONDS)
             self.assertEqual(codex_calls, [])
             self.assertEqual(claude_calls, [])
 
