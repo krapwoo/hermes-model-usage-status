@@ -274,6 +274,18 @@ function CreditsSection({ providerId, credits }) {
   const presentation = creditPresentation(providerId, credits)
   const stale = credits?.freshness === 'stale'
   const monthly = presentation.monthly
+  const monthlyFacts = []
+  if (monthly?.used != null && monthly?.limit != null) {
+    monthlyFacts.push(`${monthly.used}/${monthly.limit} credits`)
+  } else if (monthly?.used != null) {
+    monthlyFacts.push(`${monthly.used} credits used`)
+  } else if (monthly?.limit != null) {
+    monthlyFacts.push(`${monthly.limit} credit limit`)
+  }
+  if (Number.isFinite(monthly?.remainingPercent)) {
+    monthlyFacts.push(`${percent(monthly.remainingPercent)} remaining`)
+  }
+  if (monthly?.reached) monthlyFacts.push('Reached')
 
   return jsxs('div', {
     className: 'border-t border-(--ui-stroke-secondary) pt-2',
@@ -307,8 +319,7 @@ function CreditsSection({ providerId, credits }) {
               }),
               jsx('div', {
                 className: 'text-foreground',
-                children: `${monthly.used}/${monthly.limit} credits · ${percent(monthly.remainingPercent)} remaining` +
-                  (monthly.reached ? ' · Reached' : '')
+                children: monthlyFacts.length ? monthlyFacts.join(' · ') : 'Details unavailable'
               }),
               jsx('div', {
                 className: 'text-[0.6875rem] text-(--ui-text-tertiary)',

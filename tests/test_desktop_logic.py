@@ -527,6 +527,20 @@ class DesktopCreditsSectionRenderTests(unittest.TestCase):
         self.assertTrue(any("8" in t and "10" in t and "20%" in t for t in texts), texts)
         self.assertFalse(any("$" in t for t in texts))
 
+    def test_partial_monthly_limit_omits_missing_amounts_without_rendering_null(self) -> None:
+        credits = codex_credits(
+            balance={"available": True, "amount_credits": "9.5", "unlimited": False},
+            spend={"used_credits": None, "limit_credits": None,
+                   "remaining_percent": 50.0, "resets_at": 500},
+            active=False, low=False, exhausted=False,
+        )
+        tree = self.render("codex", credits)
+        texts = collect_text(tree)
+        self.assertIn("Monthly credit limit", texts)
+        self.assertIn("50% remaining", texts)
+        self.assertFalse(any("null" in text.lower() for text in texts), texts)
+        self.assertTrue(any("1969" in text or "1970" in text for text in texts), texts)
+
     def test_monthly_row_marks_reached_while_still_retaining_all_required_fields(self) -> None:
         credits = codex_credits(
             balance={"available": True, "amount_credits": "9.5", "unlimited": False},
