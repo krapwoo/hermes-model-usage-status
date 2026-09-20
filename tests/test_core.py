@@ -603,6 +603,18 @@ class CodexCreditNormalizationTests(unittest.TestCase):
             "observed_at": 100, "source": "codex-app-server", "error_code": None,
         })
 
+    def test_reached_signal_with_has_credits_false_and_no_balance_reports_null_balance(self) -> None:
+        credits = normalize_codex_result(self.result(
+            {"hasCredits": False, "unlimited": False, "balance": None},
+            spend_control_reached=True,
+        ), observed_at=100)["credits"]
+        self.assertEqual(credits, {
+            "status": "current", "freshness": "current", "unit": "credits",
+            "currency": None, "minor_unit_scale": None, "balance": None,
+            "spend": None, "active": True, "low": False, "exhausted": True,
+            "observed_at": 100, "source": "codex-app-server", "error_code": None,
+        })
+
     def test_has_credits_false_with_positive_balance_is_malformed(self) -> None:
         credits = normalize_codex_result(self.result(
             {"hasCredits": False, "unlimited": False, "balance": "4"},

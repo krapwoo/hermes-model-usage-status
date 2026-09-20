@@ -274,6 +274,8 @@ def _normalize_codex_credits(
 
     if unlimited:
         balance = {"available": True, "amount_credits": None, "unlimited": True}
+    elif has_credits is False and balance_amount is None:
+        balance = None
     else:
         balance = {"available": True, "amount_credits": balance_amount, "unlimited": False}
 
