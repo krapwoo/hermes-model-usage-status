@@ -88,6 +88,22 @@ class DesktopPluginContractTests(unittest.TestCase):
 
         self.assertTrue(entry.is_file())
 
+    def test_credit_contract_version_and_existing_surfaces(self) -> None:
+        source = PLUGIN.read_text(encoding="utf-8")
+        self.assertIn("const DATA_CONTRACT_VERSION = 4", source)
+        self.assertEqual(source.count("area: STATUSBAR_AREAS.right"), 2)
+        self.assertEqual(source.count("useQuery({"), 1)
+        self.assertIn("'/usage'", source)
+        self.assertIn("'/refresh'", source)
+        self.assertNotIn("Progress", source)
+
+    def test_popover_has_text_only_credits_before_provider_source(self) -> None:
+        source = PLUGIN.read_text(encoding="utf-8")
+        self.assertIn("function CreditsSection", source)
+        self.assertIn("children: 'Credits'", source)
+        self.assertIn("creditPresentation", source)
+        self.assertLess(source.index("jsx(CreditsSection"), source.index("provider?.source"))
+
 
 if __name__ == "__main__":
     unittest.main()

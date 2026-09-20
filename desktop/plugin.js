@@ -9,7 +9,7 @@ import {
 import { useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
-const DATA_CONTRACT_VERSION = 3
+const DATA_CONTRACT_VERSION = 4
 const QUERY_KEY = ['model-usage-status', DATA_CONTRACT_VERSION]
 let rest = null
 
@@ -37,15 +37,133 @@ function percent(value) {
   return Number.isFinite(value) ? `${Math.round(value)}%` : '—'
 }
 
-function compactLabel(providerId, provider) {
+function formatCurrencyMinor(amountMinor, currency, scale, locale) {
+  if (!Number.isSafeInteger(amountMinor) || amountMinor < 0 ||
+      !/^[A-Z]{3}$/.test(currency || '') || !Number.isInteger(scale) || scale < 0 || scale > 6) {
+    return null
+  }
+  const divisor = 10 ** scale
+  const fractionDigits = amountMinor % divisor === 0 ? 0 : scale
+  return new Intl.NumberFormat(locale ? [locale] : [], {
+    style: 'currency', currency,
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: fractionDigits
+  }).format(amountMinor / divisor)
+}
+
+function selectCompactAllowance(windows) {
+  const valid = (Array.isArray(windows) ? windows : []).filter(
+    window => Number.isFinite(window?.remaining_percent) &&
+      (window.duration_minutes === 300 || window.duration_minutes === 10080)
+  )
+  const weekly = valid.find(window => window.duration_minutes === 10080)
+  const short = valid.find(window => window.duration_minutes === 300)
+  if (weekly?.remaining_percent === 0) return weekly
+  if (short?.remaining_percent === 0) return short
+  if (!short) return weekly || null
+  if (!weekly) return short
+  return weekly.remaining_percent <= short.remaining_percent ? weekly : short
+}
+
+function creditIsConsequential(credits) {
+  return credits?.status === 'current' &&
+    Boolean(credits.active || credits.low || credits.exhausted)
+}
+
+const UNAVAILABLE_CREDIT_PRESENTATION = {
+  primary: 'Unavailable', supporting: null, monthly: null, compact: null, consequential: false
+}
+const OFF_CREDIT_PRESENTATION = {
+  primary: 'Off', supporting: null, monthly: null, compact: null, consequential: false
+}
+
+function creditPresentation(providerId, credits, locale) {
+  if (!credits || typeof credits !== 'object') return UNAVAILABLE_CREDIT_PRESENTATION
+  if (credits.status === 'off') return OFF_CREDIT_PRESENTATION
+  if (credits.status !== 'current') return UNAVAILABLE_CREDIT_PRESENTATION
+
+  const consequential = creditIsConsequential(credits)
+
+  if (credits.unit === 'currency') {
+    const { currency, minor_unit_scale: scale, spend } = credits
+    if (!spend || !Number.isSafeInteger(spend.used_minor) || !Number.isSafeInteger(spend.limit_minor)) {
+      return UNAVAILABLE_CREDIT_PRESENTATION
+    }
+    const remainingMinor = Math.max(spend.limit_minor - spend.used_minor, 0)
+    const remaining = formatCurrencyMinor(remainingMinor, currency, scale, locale)
+    const used = formatCurrencyMinor(spend.used_minor, currency, scale, locale)
+    const limit = formatCurrencyMinor(spend.limit_minor, currency, scale, locale)
+    if (remaining === null || used === null || limit === null) return UNAVAILABLE_CREDIT_PRESENTATION
+
+    const qualifier = credits.exhausted ? 'Exhausted' : credits.low ? 'Low' : null
+    const primary = qualifier ? `${remaining} left · ${qualifier}` : `${remaining} left`
+    const compactBase = `Credits ${used}/${limit}`
+    const compact = qualifier ? `${compactBase} · ${qualifier}` : compactBase
+
+    return { primary, supporting: null, monthly: `${limit} monthly limit`, compact, consequential }
+  }
+
+  if (credits.unit === 'credits') {
+    const { balance, spend } = credits
+    let base = null
+    let supporting = null
+    if (balance && balance.unlimited) {
+      base = 'Unlimited'
+    } else if (balance && balance.amount_credits != null) {
+      base = `${balance.amount_credits} credits left`
+    } else if (balance && balance.available) {
+      base = 'Available'
+      supporting = 'Exact balance not shown by the provider.'
+    }
+
+    const monthlyQualified = !base || Boolean(spend)
+    const qualifier = credits.exhausted
+      ? (monthlyQualified ? 'Monthly limit reached' : 'Exhausted')
+      : credits.low
+        ? (monthlyQualified ? 'Monthly limit low' : 'Low')
+        : null
+
+    let text
+    if (base && qualifier) {
+      text = `${base} · ${qualifier}`
+    } else if (base) {
+      text = base
+    } else if (qualifier) {
+      text = qualifier
+    } else {
+      return UNAVAILABLE_CREDIT_PRESENTATION
+    }
+
+    const monthly = spend && spend.limit_credits != null ? `${spend.limit_credits} credits monthly limit` : null
+
+    return { primary: text, supporting, monthly, compact: text, consequential }
+  }
+
+  return UNAVAILABLE_CREDIT_PRESENTATION
+}
+
+function compactLabel(providerId, provider, locale) {
   const name = providerId === 'claude' ? 'Claude' : 'Codex'
   const windows = Array.isArray(provider?.windows) ? provider.windows : []
-  if (!windows.length) {
-    return `${name} —`
+  const credits = provider?.credits
+  const presentation = creditPresentation(providerId, credits, locale)
+
+  if (!presentation.consequential || !presentation.compact) {
+    if (!windows.length) {
+      return `${name} —`
+    }
+    const values = windows.map(window => `${window.label} ${percent(window.remaining_percent)}`).join(' · ')
+    const stale = provider.status === 'stale' || provider.status === 'expired' ? ' · stale' : ''
+    return `${name} ${values}${stale}`
   }
-  const values = windows.map(window => `${window.label} ${percent(window.remaining_percent)}`).join(' · ')
-  const stale = provider.status === 'stale' || provider.status === 'expired' ? ' · stale' : ''
-  return `${name} ${values}${stale}`
+
+  const allowance = selectCompactAllowance(windows)
+  const allowanceFact = allowance ? `${allowance.label} ${percent(allowance.remaining_percent)}` : null
+  const parts = [allowanceFact, presentation.compact].filter(Boolean)
+  const stale = provider?.status === 'stale' || provider?.status === 'expired' || credits?.freshness === 'stale'
+    ? ' · stale'
+    : ''
+  return `${name} ${parts.join(' · ')}${stale}`
 }
 
 function dateTime(epoch) {
@@ -99,6 +217,31 @@ function WindowRow({ window }) {
       jsx('div', {
         className: 'shrink-0 tabular-nums text-foreground',
         children: `${percent(window.remaining_percent)} left`
+      })
+    ]
+  })
+}
+
+function CreditsSection({ providerId, credits }) {
+  const presentation = creditPresentation(providerId, credits)
+  const stale = credits?.freshness === 'stale'
+  const supportingText = stale ? age(credits.observed_at) : presentation.supporting
+
+  return jsxs('div', {
+    className: 'border-t border-(--ui-stroke-secondary) pt-2',
+    children: [
+      jsx('div', { className: 'pb-1 font-medium text-(--ui-text-secondary)', children: 'Credits' }),
+      jsxs('div', {
+        className: 'space-y-2',
+        children: [
+          jsx('div', { className: 'text-foreground', children: presentation.primary }),
+          supportingText
+            ? jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-tertiary)', children: supportingText })
+            : null,
+          presentation.monthly
+            ? jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-tertiary)', children: presentation.monthly })
+            : null
+        ]
       })
     ]
   })
@@ -214,6 +357,7 @@ function ProviderDetails({
           ]
         }, model.id)
       ),
+      jsx(CreditsSection, { providerId, credits: provider?.credits }),
       provider?.source
         ? jsx('div', {
             className: 'border-t border-(--ui-stroke-secondary) pt-2 text-[0.625rem] text-(--ui-text-quaternary)',
@@ -317,3 +461,5 @@ export default {
     })
   }
 }
+
+export { compactLabel, creditPresentation, formatCurrencyMinor, selectCompactAllowance }
