@@ -477,9 +477,16 @@ def _claude_oauth_window(window_id: str, label: str, raw: Any) -> dict[str, Any]
     if not isinstance(raw, dict):
         return None
     utilization = _number(raw.get("utilization"))
-    if utilization is None or not (0 <= utilization <= 1):
+    if utilization is None:
         return None
-    percentages = _remaining_percent(utilization * 100)
+    # Anthropic has emitted both fractional utilization (0.235 = 23.5%) and
+    # percentage points (6.0 = 6%). The newer percentage-point response also
+    # carries dollar-limit keys, which disambiguate sub-one values such as 0.4%.
+    reports_percentage_points = any(
+        key in raw for key in ("limit_dollars", "used_dollars", "remaining_dollars")
+    )
+    used_percent = utilization if reports_percentage_points or utilization > 1 else utilization * 100
+    percentages = _remaining_percent(used_percent)
     if percentages is None:
         return None
     used, remaining = percentages

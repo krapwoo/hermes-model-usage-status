@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -223,10 +223,11 @@ class ClaudeOAuthUsageTests(unittest.TestCase):
         self.assertEqual(provider["credits"]["spend"]["used_minor"], 1840)
 
     def test_default_path_imports_the_installed_hermes_credential_resolver(self) -> None:
+        credentials = ModuleType("agent.anthropic_credentials")
+        setattr(credentials, "resolve_anthropic_token", lambda: "oauth-secret-token")
+        setattr(credentials, "_is_oauth_token", lambda _token: True)
         with (
-            patch("agent.anthropic_credentials.resolve_anthropic_token",
-                  return_value="oauth-secret-token"),
-            patch("agent.anthropic_credentials._is_oauth_token", return_value=True),
+            patch.dict(sys.modules, {"agent.anthropic_credentials": credentials}),
             patch("model_usage_status.service._claude_request_json",
                   return_value=self.payload()),
         ):

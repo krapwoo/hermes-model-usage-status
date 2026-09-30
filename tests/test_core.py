@@ -122,6 +122,27 @@ class ClaudeNormalizationTests(unittest.TestCase):
         self.assertEqual([window["label"] for window in provider["windows"]], ["5h", "Week"])
         self.assertEqual([window["remaining_percent"] for window in provider["windows"]], [76.5, 58.8])
 
+    def test_oauth_percentage_point_utilization_preserves_session_and_week(self) -> None:
+        payload = {
+            "five_hour": {
+                "utilization": 0.4,
+                "limit_dollars": None,
+                "resets_at": "2026-09-27T18:00:00Z",
+            },
+            "seven_day": {
+                "utilization": 6.0,
+                "limit_dollars": None,
+                "resets_at": "2026-10-04T18:00:00Z",
+            },
+        }
+
+        provider = normalize_claude_oauth_result(payload, observed_at=1790520000)
+
+        self.assertEqual(provider["status"], "current")
+        self.assertEqual([window["label"] for window in provider["windows"]], ["5h", "Week"])
+        self.assertEqual([window["used_percent"] for window in provider["windows"]], [0.4, 6.0])
+        self.assertEqual([window["remaining_percent"] for window in provider["windows"]], [99.6, 94.0])
+
     def test_missing_window_is_unavailable_not_zero(self) -> None:
         provider = normalize_claude_payload({"rate_limits": {}}, observed_at=100)
 
