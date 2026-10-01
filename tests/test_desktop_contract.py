@@ -83,10 +83,50 @@ class DesktopPluginContractTests(unittest.TestCase):
         self.assertIn("method: 'POST'", source)
         self.assertIn("queryClient.invalidateQueries({ queryKey: QUERY_KEY })", source)
 
+    def test_every_backend_call_is_pinned_to_the_local_primary_backend(self) -> None:
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        # Usage must read the same local machine/account state no matter which
+        # Hermes profile or remote connection the desktop window is on. One
+        # shared `call()` helper injects the target so /usage, /refresh, and
+        # /authentication/<provider> all resolve local-primary uniformly.
+        self.assertIn("function call(path, options)", source)
+        self.assertEqual(source.count("target: 'local-primary'"), 1)
+        self.assertRegex(source, r"rest\(path,\s*\{\s*\.\.\.options,\s*target:\s*'local-primary'\s*\}\)")
+
     def test_manifest_entry_is_present_in_public_source(self) -> None:
         entry = PLUGIN.parents[1] / "dashboard" / "dist" / "index.js"
 
         self.assertTrue(entry.is_file())
+
+    def test_credit_contract_version_and_existing_surfaces(self) -> None:
+        source = PLUGIN.read_text(encoding="utf-8")
+        self.assertIn("const DATA_CONTRACT_VERSION = 4", source)
+        self.assertEqual(source.count("area: STATUSBAR_AREAS.right"), 2)
+        self.assertEqual(source.count("useQuery({"), 1)
+        self.assertIn("'/usage'", source)
+        self.assertIn("'/refresh'", source)
+        self.assertNotIn("Progress", source)
+
+    def test_popover_has_text_only_credits_before_provider_source(self) -> None:
+        source = PLUGIN.read_text(encoding="utf-8")
+        self.assertIn("function CreditsSection", source)
+        self.assertIn("children: 'Credits'", source)
+        self.assertIn("creditPresentation", source)
+        self.assertLess(source.index("jsx(CreditsSection"), source.index("provider?.source"))
+
+    def test_refresh_failure_is_caught_and_never_overwrites_cached_data(self) -> None:
+        source = PLUGIN.read_text(encoding="utf-8")
+        self.assertIn("async function refreshUsage(requestRefresh)", source)
+        helper = source[source.index("async function refreshUsage("):]
+        helper = helper[:helper.index("\n}\n") + 2]
+        # setQueryData must only ever run on the success path, before the catch.
+        self.assertLess(helper.index("queryClient.setQueryData"), helper.index("catch"))
+        self.assertIn("return { ok: false }", helper)
+        # refresh() must still disable/re-enable Refresh via finally, and must
+        # never let refreshUsage's promise reach the caller unhandled.
+        self.assertIn("await refreshUsage(", source)
+        self.assertIn("finally {\n      setRefreshing(false)\n    }", source)
 
 
 if __name__ == "__main__":

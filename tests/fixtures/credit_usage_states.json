@@ -1,0 +1,878 @@
+{
+  "active": {
+    "generated_at": 1000,
+    "providers": {
+      "claude": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": true,
+          "balance": null,
+          "currency": "USD",
+          "error_code": null,
+          "exhausted": false,
+          "freshness": "current",
+          "low": false,
+          "minor_unit_scale": 2,
+          "observed_at": 1000,
+          "source": "claude-oauth-usage",
+          "spend": {
+            "limit_minor": 10000,
+            "remaining_percent": 81.6,
+            "resets_at": null,
+            "used_minor": 1840
+          },
+          "status": "current",
+          "unit": "currency"
+        },
+        "error_code": null,
+        "id": "claude",
+        "model_limits": [
+          {
+            "id": "claude:opus",
+            "label": "Opus",
+            "windows": [
+              {
+                "duration_minutes": 10080,
+                "id": "claude:opus:week",
+                "label": "Opus week",
+                "remaining_percent": 1.0,
+                "resets_at": 7000,
+                "used_percent": 99.0
+              }
+            ]
+          }
+        ],
+        "observed_at": 1000,
+        "source": "claude-oauth-usage",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 300,
+            "id": "claude:five_hour",
+            "label": "5h",
+            "remaining_percent": 70.0,
+            "resets_at": 1789866000,
+            "used_percent": 30.0
+          },
+          {
+            "duration_minutes": 10080,
+            "id": "claude:seven_day",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 1790298000,
+            "used_percent": 45.0
+          }
+        ]
+      },
+      "codex": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": true,
+          "balance": {
+            "amount_credits": "9.5",
+            "available": true,
+            "unlimited": false
+          },
+          "currency": null,
+          "error_code": null,
+          "exhausted": false,
+          "freshness": "current",
+          "low": false,
+          "minor_unit_scale": null,
+          "observed_at": 1000,
+          "source": "codex-app-server",
+          "spend": null,
+          "status": "current",
+          "unit": "credits"
+        },
+        "error_code": null,
+        "id": "codex",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "Codex app-server account/rateLimits/read",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 10080,
+            "id": "codex:primary",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 6000,
+            "used_percent": 45.0
+          }
+        ]
+      }
+    },
+    "schema_version": 2
+  },
+  "allowance_only": {
+    "generated_at": 1000,
+    "providers": {
+      "claude": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": false,
+          "balance": null,
+          "currency": "USD",
+          "error_code": null,
+          "exhausted": false,
+          "freshness": "current",
+          "low": false,
+          "minor_unit_scale": 2,
+          "observed_at": 1000,
+          "source": "claude-oauth-usage",
+          "spend": {
+            "limit_minor": 10000,
+            "remaining_percent": 100.0,
+            "resets_at": null,
+            "used_minor": 0
+          },
+          "status": "current",
+          "unit": "currency"
+        },
+        "error_code": null,
+        "id": "claude",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "claude-oauth-usage",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 300,
+            "id": "claude:five_hour",
+            "label": "5h",
+            "remaining_percent": 70.0,
+            "resets_at": 1789866000,
+            "used_percent": 30.0
+          },
+          {
+            "duration_minutes": 10080,
+            "id": "claude:seven_day",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 1790298000,
+            "used_percent": 45.0
+          }
+        ]
+      },
+      "codex": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": false,
+          "balance": {
+            "amount_credits": "9.5",
+            "available": true,
+            "unlimited": false
+          },
+          "currency": null,
+          "error_code": null,
+          "exhausted": false,
+          "freshness": "current",
+          "low": false,
+          "minor_unit_scale": null,
+          "observed_at": 1000,
+          "source": "codex-app-server",
+          "spend": null,
+          "status": "current",
+          "unit": "credits"
+        },
+        "error_code": null,
+        "id": "codex",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "Codex app-server account/rateLimits/read",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 10080,
+            "id": "codex:primary",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 6000,
+            "used_percent": 45.0
+          }
+        ]
+      }
+    },
+    "schema_version": 2
+  },
+  "exhausted": {
+    "generated_at": 1000,
+    "providers": {
+      "claude": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": true,
+          "balance": null,
+          "currency": "USD",
+          "error_code": null,
+          "exhausted": true,
+          "freshness": "current",
+          "low": true,
+          "minor_unit_scale": 2,
+          "observed_at": 1000,
+          "source": "claude-oauth-usage",
+          "spend": {
+            "limit_minor": 10000,
+            "remaining_percent": 0.0,
+            "resets_at": null,
+            "used_minor": 10000
+          },
+          "status": "current",
+          "unit": "currency"
+        },
+        "error_code": null,
+        "id": "claude",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "claude-oauth-usage",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 300,
+            "id": "claude:five_hour",
+            "label": "5h",
+            "remaining_percent": 70.0,
+            "resets_at": 1789866000,
+            "used_percent": 30.0
+          },
+          {
+            "duration_minutes": 10080,
+            "id": "claude:seven_day",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 1790298000,
+            "used_percent": 45.0
+          }
+        ]
+      },
+      "codex": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": true,
+          "balance": {
+            "amount_credits": "9.5",
+            "available": true,
+            "unlimited": false
+          },
+          "currency": null,
+          "error_code": null,
+          "exhausted": true,
+          "freshness": "current",
+          "low": true,
+          "minor_unit_scale": null,
+          "observed_at": 1000,
+          "source": "codex-app-server",
+          "spend": {
+            "limit_credits": "10",
+            "remaining_percent": 0.0,
+            "resets_at": 6500,
+            "used_credits": "10"
+          },
+          "status": "current",
+          "unit": "credits"
+        },
+        "error_code": null,
+        "id": "codex",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "Codex app-server account/rateLimits/read",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 10080,
+            "id": "codex:primary",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 6000,
+            "used_percent": 45.0
+          }
+        ]
+      }
+    },
+    "schema_version": 2
+  },
+  "hidden": {
+    "generated_at": 1000,
+    "providers": {
+      "claude": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": false,
+          "balance": null,
+          "currency": "USD",
+          "error_code": null,
+          "exhausted": false,
+          "freshness": "current",
+          "low": false,
+          "minor_unit_scale": 2,
+          "observed_at": 1000,
+          "source": "claude-oauth-usage",
+          "spend": {
+            "limit_minor": 10000,
+            "remaining_percent": 100.0,
+            "resets_at": null,
+            "used_minor": 0
+          },
+          "status": "current",
+          "unit": "currency"
+        },
+        "error_code": null,
+        "id": "claude",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "claude-oauth-usage",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 300,
+            "id": "claude:five_hour",
+            "label": "5h",
+            "remaining_percent": 70.0,
+            "resets_at": 1789866000,
+            "used_percent": 30.0
+          },
+          {
+            "duration_minutes": 10080,
+            "id": "claude:seven_day",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 1790298000,
+            "used_percent": 45.0
+          }
+        ]
+      },
+      "codex": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": false,
+          "balance": {
+            "amount_credits": null,
+            "available": true,
+            "unlimited": false
+          },
+          "currency": null,
+          "error_code": null,
+          "exhausted": false,
+          "freshness": "current",
+          "low": false,
+          "minor_unit_scale": null,
+          "observed_at": 1000,
+          "source": "codex-app-server",
+          "spend": null,
+          "status": "current",
+          "unit": "credits"
+        },
+        "error_code": null,
+        "id": "codex",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "Codex app-server account/rateLimits/read",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 10080,
+            "id": "codex:primary",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 6000,
+            "used_percent": 45.0
+          }
+        ]
+      }
+    },
+    "schema_version": 2
+  },
+  "low": {
+    "generated_at": 1000,
+    "providers": {
+      "claude": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": true,
+          "balance": null,
+          "currency": "USD",
+          "error_code": null,
+          "exhausted": false,
+          "freshness": "current",
+          "low": true,
+          "minor_unit_scale": 2,
+          "observed_at": 1000,
+          "source": "claude-oauth-usage",
+          "spend": {
+            "limit_minor": 10000,
+            "remaining_percent": 15.0,
+            "resets_at": null,
+            "used_minor": 8500
+          },
+          "status": "current",
+          "unit": "currency"
+        },
+        "error_code": null,
+        "id": "claude",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "claude-oauth-usage",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 300,
+            "id": "claude:five_hour",
+            "label": "5h",
+            "remaining_percent": 70.0,
+            "resets_at": 1789866000,
+            "used_percent": 30.0
+          },
+          {
+            "duration_minutes": 10080,
+            "id": "claude:seven_day",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 1790298000,
+            "used_percent": 45.0
+          }
+        ]
+      },
+      "codex": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": true,
+          "balance": {
+            "amount_credits": "9.5",
+            "available": true,
+            "unlimited": false
+          },
+          "currency": null,
+          "error_code": null,
+          "exhausted": false,
+          "freshness": "current",
+          "low": true,
+          "minor_unit_scale": null,
+          "observed_at": 1000,
+          "source": "codex-app-server",
+          "spend": {
+            "limit_credits": "10",
+            "remaining_percent": 20.0,
+            "resets_at": 6500,
+            "used_credits": "8"
+          },
+          "status": "current",
+          "unit": "credits"
+        },
+        "error_code": null,
+        "id": "codex",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "Codex app-server account/rateLimits/read",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 10080,
+            "id": "codex:primary",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 6000,
+            "used_percent": 45.0
+          }
+        ]
+      }
+    },
+    "schema_version": 2
+  },
+  "off": {
+    "generated_at": 1000,
+    "providers": {
+      "claude": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": false,
+          "balance": null,
+          "currency": null,
+          "error_code": null,
+          "exhausted": false,
+          "freshness": "current",
+          "low": false,
+          "minor_unit_scale": null,
+          "observed_at": 1000,
+          "source": "claude-oauth-usage",
+          "spend": null,
+          "status": "off",
+          "unit": "currency"
+        },
+        "error_code": null,
+        "id": "claude",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "claude-oauth-usage",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 300,
+            "id": "claude:five_hour",
+            "label": "5h",
+            "remaining_percent": 70.0,
+            "resets_at": 1789866000,
+            "used_percent": 30.0
+          },
+          {
+            "duration_minutes": 10080,
+            "id": "claude:seven_day",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 1790298000,
+            "used_percent": 45.0
+          }
+        ]
+      },
+      "codex": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": false,
+          "balance": null,
+          "currency": null,
+          "error_code": null,
+          "exhausted": false,
+          "freshness": "current",
+          "low": false,
+          "minor_unit_scale": null,
+          "observed_at": 1000,
+          "source": "codex-app-server",
+          "spend": null,
+          "status": "off",
+          "unit": "credits"
+        },
+        "error_code": null,
+        "id": "codex",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "Codex app-server account/rateLimits/read",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 10080,
+            "id": "codex:primary",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 6000,
+            "used_percent": 45.0
+          }
+        ]
+      }
+    },
+    "schema_version": 2
+  },
+  "stale_auth": {
+    "generated_at": 1000,
+    "providers": {
+      "claude": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": true,
+          "balance": null,
+          "currency": "USD",
+          "error_code": null,
+          "exhausted": false,
+          "freshness": "stale",
+          "low": false,
+          "minor_unit_scale": 2,
+          "observed_at": 400,
+          "source": "claude-oauth-usage",
+          "spend": {
+            "limit_minor": 10000,
+            "remaining_percent": 81.6,
+            "resets_at": null,
+            "used_minor": 1840
+          },
+          "status": "current",
+          "unit": "currency"
+        },
+        "error_code": null,
+        "id": "claude",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "claude-oauth-usage",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 300,
+            "id": "claude:five_hour",
+            "label": "5h",
+            "remaining_percent": 70.0,
+            "resets_at": 1789866000,
+            "used_percent": 30.0
+          },
+          {
+            "duration_minutes": 10080,
+            "id": "claude:seven_day",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 1790298000,
+            "used_percent": 45.0
+          }
+        ]
+      },
+      "codex": {
+        "authentication": {
+          "action_available": true,
+          "state": "required"
+        },
+        "credits": {
+          "active": false,
+          "balance": null,
+          "currency": null,
+          "error_code": "auth_rejected",
+          "exhausted": false,
+          "freshness": null,
+          "low": false,
+          "minor_unit_scale": null,
+          "observed_at": null,
+          "source": null,
+          "spend": null,
+          "status": "unavailable",
+          "unit": "credits"
+        },
+        "error_code": "authentication_required",
+        "id": "codex",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "Codex app-server account/rateLimits/read",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 10080,
+            "id": "codex:primary",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 6000,
+            "used_percent": 45.0
+          }
+        ]
+      }
+    },
+    "schema_version": 2
+  },
+  "unavailable": {
+    "generated_at": 1000,
+    "providers": {
+      "claude": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": false,
+          "balance": null,
+          "currency": null,
+          "error_code": "provider_unavailable",
+          "exhausted": false,
+          "freshness": null,
+          "low": false,
+          "minor_unit_scale": null,
+          "observed_at": null,
+          "source": null,
+          "spend": null,
+          "status": "unavailable",
+          "unit": "currency"
+        },
+        "error_code": null,
+        "id": "claude",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "claude-oauth-usage",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 300,
+            "id": "claude:five_hour",
+            "label": "5h",
+            "remaining_percent": 70.0,
+            "resets_at": 1789866000,
+            "used_percent": 30.0
+          },
+          {
+            "duration_minutes": 10080,
+            "id": "claude:seven_day",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 1790298000,
+            "used_percent": 45.0
+          }
+        ]
+      },
+      "codex": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": false,
+          "balance": null,
+          "currency": null,
+          "error_code": "unsupported",
+          "exhausted": false,
+          "freshness": null,
+          "low": false,
+          "minor_unit_scale": null,
+          "observed_at": null,
+          "source": null,
+          "spend": null,
+          "status": "unavailable",
+          "unit": "credits"
+        },
+        "error_code": null,
+        "id": "codex",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "Codex app-server account/rateLimits/read",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 10080,
+            "id": "codex:primary",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 6000,
+            "used_percent": 45.0
+          }
+        ]
+      }
+    },
+    "schema_version": 2
+  },
+  "unlimited": {
+    "generated_at": 1000,
+    "providers": {
+      "claude": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": false,
+          "balance": null,
+          "currency": "USD",
+          "error_code": null,
+          "exhausted": false,
+          "freshness": "current",
+          "low": false,
+          "minor_unit_scale": 2,
+          "observed_at": 1000,
+          "source": "claude-oauth-usage",
+          "spend": {
+            "limit_minor": 10000,
+            "remaining_percent": 100.0,
+            "resets_at": null,
+            "used_minor": 0
+          },
+          "status": "current",
+          "unit": "currency"
+        },
+        "error_code": null,
+        "id": "claude",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "claude-oauth-usage",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 300,
+            "id": "claude:five_hour",
+            "label": "5h",
+            "remaining_percent": 70.0,
+            "resets_at": 1789866000,
+            "used_percent": 30.0
+          },
+          {
+            "duration_minutes": 10080,
+            "id": "claude:seven_day",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 1790298000,
+            "used_percent": 45.0
+          }
+        ]
+      },
+      "codex": {
+        "authentication": {
+          "action_available": false,
+          "state": "authenticated"
+        },
+        "credits": {
+          "active": false,
+          "balance": {
+            "amount_credits": null,
+            "available": true,
+            "unlimited": true
+          },
+          "currency": null,
+          "error_code": null,
+          "exhausted": false,
+          "freshness": "current",
+          "low": false,
+          "minor_unit_scale": null,
+          "observed_at": 1000,
+          "source": "codex-app-server",
+          "spend": null,
+          "status": "current",
+          "unit": "credits"
+        },
+        "error_code": null,
+        "id": "codex",
+        "model_limits": [],
+        "observed_at": 1000,
+        "source": "Codex app-server account/rateLimits/read",
+        "status": "current",
+        "windows": [
+          {
+            "duration_minutes": 10080,
+            "id": "codex:primary",
+            "label": "Week",
+            "remaining_percent": 55.0,
+            "resets_at": 6000,
+            "used_percent": 45.0
+          }
+        ]
+      }
+    },
+    "schema_version": 2
+  }
+}

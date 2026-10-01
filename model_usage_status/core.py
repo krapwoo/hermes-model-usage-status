@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 from copy import deepcopy
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 
@@ -43,6 +47,298 @@ def _window_label(duration_minutes: int | None, fallback: str) -> str:
     if duration_minutes:
         return f"{duration_minutes}m"
     return fallback
+
+
+_CREDIT_ERROR_CODES = {
+    "auth_rejected", "timeout", "rate_limited", "provider_unavailable",
+    "malformed", "unsupported", None,
+}
+_TRANSIENT_CREDIT_CODES = {"timeout", "rate_limited", "provider_unavailable"}
+_DECIMAL_CREDITS = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z")
+_CURRENCY_CODE = re.compile(r"[A-Z]{3}\Z")
+
+
+def _sanitized_credit_unit(value: Any, default: str = "credits") -> str:
+    return value if isinstance(value, str) and value in {"currency", "credits"} else default
+
+
+def _sanitized_credit_error_code(value: Any) -> str:
+    return value if isinstance(value, str) and value in _CREDIT_ERROR_CODES else "provider_unavailable"
+
+
+def unavailable_credits(unit: str, error_code: str) -> dict[str, Any]:
+    if not isinstance(unit, str) or unit not in {"currency", "credits"}:
+        raise ValueError("invalid_credit_unit")
+    if not isinstance(error_code, str) or error_code not in _CREDIT_ERROR_CODES:
+        raise ValueError("invalid_credit_error_code")
+    return {
+        "status": "unavailable", "freshness": None, "unit": unit,
+        "currency": None, "minor_unit_scale": None, "balance": None,
+        "spend": None, "active": False, "low": False, "exhausted": False,
+        "observed_at": None, "source": None, "error_code": error_code,
+    }
+
+
+def _non_negative_integer(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        if not math.isfinite(value) or value < 0 or int(value) != value:
+            return None
+        return int(value)
+    return None
+
+
+def _credit_scale(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if not (0 <= value <= 6):
+        return None
+    return value
+
+
+def _credit_decimal(value: Any) -> str | None:
+    if not isinstance(value, str) or not _DECIMAL_CREDITS.fullmatch(value):
+        return None
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation:
+        return None
+    return value if parsed.is_finite() and parsed >= 0 else None
+
+
+def _remaining(used: Decimal, limit: Decimal) -> float | None:
+    if limit <= 0:
+        return None
+    return float(max(Decimal(0), (limit - used) * Decimal(100) / limit))
+
+
+def _iso_to_epoch(value: Any) -> int | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.astimezone(timezone.utc).timestamp())
+
+
+def _normalize_claude_credits(extra_usage: Any, observed_at: int) -> dict[str, Any]:
+    if not isinstance(extra_usage, dict):
+        return unavailable_credits("currency", "unsupported")
+
+    is_enabled = extra_usage.get("is_enabled")
+    if is_enabled is False:
+        return {
+            "status": "off", "freshness": "current", "unit": "currency",
+            "currency": None, "minor_unit_scale": None, "balance": None,
+            "spend": None, "active": False, "low": False, "exhausted": False,
+            "observed_at": int(observed_at), "source": "claude-oauth-usage", "error_code": None,
+        }
+    if is_enabled is not True:
+        return unavailable_credits("currency", "malformed")
+
+    currency = extra_usage.get("currency")
+    if not isinstance(currency, str) or not _CURRENCY_CODE.fullmatch(currency):
+        return unavailable_credits("currency", "malformed")
+
+    scale = _credit_scale(extra_usage.get("decimal_places"))
+    used_minor = _non_negative_integer(extra_usage.get("used_credits"))
+    limit_minor = _non_negative_integer(extra_usage.get("monthly_limit"))
+    if scale is None or used_minor is None or limit_minor is None:
+        return unavailable_credits("currency", "malformed")
+
+    if limit_minor == 0:
+        return unavailable_credits("currency", "unsupported")
+
+    raw_remaining = _remaining(Decimal(used_minor), Decimal(limit_minor))
+    exhausted = used_minor >= limit_minor
+    low = raw_remaining <= 20.0
+
+    return {
+        "status": "current", "freshness": "current", "unit": "currency",
+        "currency": currency, "minor_unit_scale": scale, "balance": None,
+        "spend": {
+            "used_minor": used_minor, "limit_minor": limit_minor,
+            "remaining_percent": round(raw_remaining, 1), "resets_at": None,
+        },
+        "active": used_minor > 0, "low": low, "exhausted": exhausted,
+        "observed_at": int(observed_at), "source": "claude-oauth-usage", "error_code": None,
+    }
+
+
+def _optional_credit_decimal(container: dict[str, Any], key: str) -> tuple[str | None, bool]:
+    if key not in container or container[key] is None:
+        return None, False
+    value = _credit_decimal(container[key])
+    return (None, True) if value is None else (value, False)
+
+
+def _codex_spend(individual_limit: Any) -> tuple[dict[str, Any] | None, bool]:
+    if individual_limit is None:
+        return None, False
+    if not isinstance(individual_limit, dict):
+        return None, True
+
+    limit_credits, limit_malformed = _optional_credit_decimal(individual_limit, "limit")
+    used_credits, used_malformed = _optional_credit_decimal(individual_limit, "used")
+    if limit_malformed or used_malformed:
+        return None, True
+    resets_at = _timestamp(individual_limit.get("resetsAt"))
+    raw_percent = individual_limit.get("remainingPercent")
+
+    if raw_percent is not None:
+        if isinstance(raw_percent, bool) or not isinstance(raw_percent, (int, float)):
+            return None, True
+        percent_value = float(raw_percent)
+        if not math.isfinite(percent_value) or not (0.0 <= percent_value <= 100.0):
+            return None, True
+        remaining_percent: float | None = percent_value
+    elif limit_credits is not None and used_credits is not None and Decimal(limit_credits) > 0:
+        remaining_percent = _remaining(Decimal(used_credits), Decimal(limit_credits))
+    else:
+        remaining_percent = None
+
+    if limit_credits is not None and used_credits is not None:
+        limit_dec = Decimal(limit_credits)
+        used_dec = Decimal(used_credits)
+        if limit_dec > 0 and used_dec >= limit_dec:
+            remaining_percent = 0.0
+
+    return {
+        "used_credits": used_credits,
+        "limit_credits": limit_credits,
+        "remaining_percent": remaining_percent,
+        "resets_at": resets_at,
+    }, False
+
+
+def _normalize_codex_credits(
+    result: dict[str, Any], account: dict[str, Any], observed_at: int
+) -> dict[str, Any]:
+    # Validate the complete sibling signal set before any early exit (Off/unsupported),
+    # so a malformed spendControlReached/individualLimit is never masked by them.
+    spend_control_reached = account.get("spendControlReached")
+    if not isinstance(spend_control_reached, bool):
+        return unavailable_credits("credits", "malformed")
+
+    spend, spend_malformed = _codex_spend(account.get("individualLimit"))
+    if spend_malformed:
+        return unavailable_credits("credits", "malformed")
+
+    raw_credits = account.get("credits")
+    if not isinstance(raw_credits, dict):
+        if spend_control_reached:
+            low = spend is not None and spend["remaining_percent"] is not None and spend["remaining_percent"] <= 20.0
+            return {
+                "status": "current", "freshness": "current", "unit": "credits",
+                "currency": None, "minor_unit_scale": None, "balance": None,
+                "spend": spend, "active": True, "low": low, "exhausted": True,
+                "observed_at": int(observed_at), "source": "codex-app-server", "error_code": None,
+            }
+        return unavailable_credits("credits", "unsupported")
+
+    has_credits = raw_credits.get("hasCredits")
+    unlimited = raw_credits.get("unlimited")
+    balance_raw = raw_credits.get("balance")
+    if not isinstance(has_credits, bool) or not isinstance(unlimited, bool):
+        return unavailable_credits("credits", "malformed")
+
+    balance_amount: str | None = None
+    if balance_raw is not None:
+        balance_amount = _credit_decimal(balance_raw)
+        if balance_amount is None:
+            return unavailable_credits("credits", "malformed")
+
+    if unlimited and balance_raw is not None:
+        return unavailable_credits("credits", "malformed")
+    if has_credits is False and unlimited:
+        return unavailable_credits("credits", "malformed")
+
+    is_zero_balance = balance_amount is not None and Decimal(balance_amount) == 0
+    is_positive_balance = balance_amount is not None and not is_zero_balance
+    if has_credits is False and is_positive_balance:
+        return unavailable_credits("credits", "malformed")
+
+    if has_credits is False and not spend_control_reached and not is_zero_balance:
+        return {
+            "status": "off", "freshness": "current", "unit": "credits",
+            "currency": None, "minor_unit_scale": None, "balance": None,
+            "spend": None, "active": False, "low": False, "exhausted": False,
+            "observed_at": int(observed_at), "source": "codex-app-server", "error_code": None,
+        }
+
+    if unlimited:
+        balance = {"available": True, "amount_credits": None, "unlimited": True}
+    elif has_credits is False and balance_amount is None:
+        balance = None
+    else:
+        balance = {"available": True, "amount_credits": balance_amount, "unlimited": False}
+
+    remaining_percent = spend["remaining_percent"] if spend else None
+    spend_used_positive = (
+        spend is not None and spend["used_credits"] is not None and Decimal(spend["used_credits"]) > 0
+    )
+    ordinary_usage_allowed = result.get("ordinaryUsageAllowed")
+
+    exhausted = bool(
+        spend_control_reached
+        or is_zero_balance
+        or (remaining_percent is not None and remaining_percent <= 0.0)
+    )
+    active = bool(spend_control_reached or spend_used_positive or ordinary_usage_allowed is False)
+    low = remaining_percent is not None and remaining_percent <= 20.0
+
+    return {
+        "status": "current", "freshness": "current", "unit": "credits",
+        "currency": None, "minor_unit_scale": None, "balance": balance,
+        "spend": spend, "active": active, "low": low, "exhausted": exhausted,
+        "observed_at": int(observed_at), "source": "codex-app-server", "error_code": None,
+    }
+
+
+def age_credit_state(credits: dict[str, Any], now: int) -> dict[str, Any]:
+    unit = _sanitized_credit_unit(credits.get("unit"))
+    observed_at = credits.get("observed_at")
+    if not isinstance(observed_at, int) or isinstance(observed_at, bool):
+        return unavailable_credits(unit, _sanitized_credit_error_code(credits.get("error_code")))
+    age = now - observed_at
+    if age < 0 or age > 900:
+        return unavailable_credits(unit, _sanitized_credit_error_code(credits.get("error_code")))
+    return deepcopy(credits)
+
+
+def merge_credit_refresh_result(
+    previous: dict[str, Any] | None,
+    fresh: dict[str, Any] | None,
+    now: int,
+    error_code: str | None,
+) -> dict[str, Any]:
+    if fresh is not None:
+        return deepcopy(fresh)
+
+    if not isinstance(previous, dict):
+        return unavailable_credits("credits", _sanitized_credit_error_code(error_code))
+
+    aged = age_credit_state(previous, now)
+    if aged["status"] == "unavailable":
+        aged = dict(aged)
+        aged["error_code"] = _sanitized_credit_error_code(error_code)
+        return aged
+
+    if isinstance(error_code, str) and error_code in _TRANSIENT_CREDIT_CODES:
+        aged = deepcopy(aged)
+        aged["freshness"] = "stale"
+        aged["error_code"] = error_code
+        return aged
+
+    return unavailable_credits(
+        _sanitized_credit_unit(aged.get("unit")), _sanitized_credit_error_code(error_code)
+    )
 
 
 def _codex_window(limit_id: str, slot: str, raw: Any) -> dict[str, Any] | None:
@@ -129,6 +425,7 @@ def normalize_codex_result(result: dict[str, Any], observed_at: int) -> dict[str
         "windows": windows,
         "model_limits": model_limits,
         "error_code": None,
+        "credits": _normalize_codex_credits(result, account, observed_at),
     }
 
 
@@ -172,6 +469,56 @@ def normalize_claude_payload(payload: dict[str, Any], observed_at: int) -> dict[
         "windows": windows,
         "model_limits": [],
         "error_code": None,
+        "credits": unavailable_credits("currency", "unsupported"),
+    }
+
+
+def _claude_oauth_window(window_id: str, label: str, raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    utilization = _number(raw.get("utilization"))
+    if utilization is None:
+        return None
+    # Anthropic has emitted both fractional utilization (0.235 = 23.5%) and
+    # percentage points (6.0 = 6%). The newer percentage-point response also
+    # carries dollar-limit keys, which disambiguate sub-one values such as 0.4%.
+    reports_percentage_points = any(
+        key in raw for key in ("limit_dollars", "used_dollars", "remaining_dollars")
+    )
+    used_percent = utilization if reports_percentage_points or utilization > 1 else utilization * 100
+    percentages = _remaining_percent(used_percent)
+    if percentages is None:
+        return None
+    used, remaining = percentages
+    duration = 300 if window_id == "five_hour" else 10080
+    return {
+        "id": f"claude:{window_id}",
+        "label": label,
+        "duration_minutes": duration,
+        "used_percent": used,
+        "remaining_percent": remaining,
+        "resets_at": _iso_to_epoch(raw.get("resets_at")),
+    }
+
+
+def normalize_claude_oauth_result(payload: dict[str, Any], observed_at: int) -> dict[str, Any]:
+    windows = [
+        window
+        for window in (
+            _claude_oauth_window("five_hour", "5h", payload.get("five_hour")),
+            _claude_oauth_window("seven_day", "Week", payload.get("seven_day")),
+        )
+        if window is not None
+    ]
+    return {
+        "id": "claude",
+        "status": "current" if windows else "unavailable",
+        "observed_at": int(observed_at),
+        "source": "claude-oauth-usage",
+        "windows": windows,
+        "model_limits": [],
+        "error_code": None,
+        "credits": _normalize_claude_credits(payload.get("extra_usage"), observed_at),
     }
 
 
@@ -261,16 +608,67 @@ def _expire_snapshot(snapshot: dict[str, Any], now: int) -> dict[str, Any]:
     return result
 
 
+_CREDIT_UNIT_BY_PROVIDER = {"claude": "currency", "codex": "credits"}
+
+
+def _tag_credit_unit(credits: dict[str, Any] | None, unit: str) -> dict[str, Any] | None:
+    if credits is None:
+        return None
+    if credits.get("unit") not in {"currency", "credits"}:
+        credits = dict(credits)
+        credits["unit"] = unit
+    return credits
+
+
+def _merged_provider_credits(
+    previous_credits: dict[str, Any] | None,
+    fresh_credits: dict[str, Any] | None,
+    now: int,
+    unit: str,
+    credit_code: str | None,
+) -> dict[str, Any]:
+    if previous_credits is None and fresh_credits is None:
+        return unavailable_credits(unit, _sanitized_credit_error_code(credit_code))
+    return merge_credit_refresh_result(previous_credits, fresh_credits, now, credit_code)
+
+
 def merge_refresh_result(
     previous: dict[str, Any] | None,
     fresh: dict[str, Any] | None,
     now: int,
     error_code: str | None = None,
+    *,
+    credit_unit: str | None = None,
+    credit_error_code: str | None = None,
 ) -> dict[str, Any]:
+    if credit_unit is not None and (
+        not isinstance(credit_unit, str) or credit_unit not in {"currency", "credits"}
+    ):
+        raise ValueError("invalid_credit_unit")
+    if credit_error_code is not None and (
+        not isinstance(credit_error_code, str) or credit_error_code not in _CREDIT_ERROR_CODES
+    ):
+        raise ValueError("invalid_credit_error_code")
+
+    provider_id = None
+    if isinstance(fresh, dict):
+        provider_id = fresh.get("id")
+    elif isinstance(previous, dict):
+        provider_id = previous.get("id")
+    unit = credit_unit or _CREDIT_UNIT_BY_PROVIDER.get(provider_id, "credits")
+    credit_code = credit_error_code
+    previous_credits = _tag_credit_unit(
+        previous.get("credits") if isinstance(previous, dict) else None, unit
+    )
+    fresh_credits = _tag_credit_unit(
+        fresh.get("credits") if isinstance(fresh, dict) else None, unit
+    )
+
     if fresh is not None:
         result = _expire_snapshot(fresh, now)
         if error_code is not None:
             result["error_code"] = error_code
+        result["credits"] = _merged_provider_credits(previous_credits, fresh_credits, now, unit, credit_code)
         return result
 
     if previous is None:
@@ -282,6 +680,7 @@ def merge_refresh_result(
             "windows": [],
             "model_limits": [],
             "error_code": error_code or "provider_unavailable",
+            "credits": unavailable_credits(unit, _sanitized_credit_error_code(credit_code)),
         }
 
     result = _expire_snapshot(previous, now)
@@ -294,4 +693,7 @@ def merge_refresh_result(
     else:
         result["status"] = "unavailable"
     result["error_code"] = error_code or "provider_unavailable"
+    result["credits"] = _merged_provider_credits(
+        previous_credits, None, now, unit, credit_code or "provider_unavailable"
+    )
     return result

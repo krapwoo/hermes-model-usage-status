@@ -8,15 +8,20 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from model_usage_status.claude_snapshot import default_output_path, record_observation  # noqa: E402
+from model_usage_status.core import normalize_claude_oauth_result, normalize_codex_result  # noqa: E402
 from model_usage_status.service import (  # noqa: E402
+    CLAUDE_TIMEOUT_SECONDS,
+    CODEX_TIMEOUT_SECONDS,
+    REFRESH_WAIT_TIMEOUT_SECONDS,
     ClaudeAuthenticationRequired,
+    ProviderUsageUnavailable,
     UsageService,
     authentication_status,
     fetch_claude_rate_limits,
@@ -32,7 +37,7 @@ def authenticated(_provider: str) -> dict:
     return dict(AUTHENTICATED)
 
 
-def unavailable_claude() -> dict:
+def unavailable_claude(_observed_at: int) -> dict:
     raise RuntimeError("claude_usage_unavailable")
 
 
@@ -49,6 +54,44 @@ def codex_result(used: int = 57) -> dict:
         },
         "rateLimitsByLimitId": {},
     }
+
+
+def normalized_claude(observed_at: int) -> dict:
+    return normalize_claude_oauth_result({
+        "five_hour": {"utilization": 0.1, "resets_at": "2026-09-20T01:00:00Z"},
+        "seven_day": {"utilization": 0.2, "resets_at": "2026-09-25T01:00:00Z"},
+        "extra_usage": {
+            "is_enabled": True, "used_credits": 1840, "monthly_limit": 10000,
+            "currency": "USD", "decimal_places": 2,
+        },
+    }, observed_at)
+
+
+def write_passive_observation(data_dir: Path, observed_at: int) -> None:
+    (data_dir / "claude-observation.json").write_text(json.dumps({
+        "schema_version": 1,
+        "provider": "claude",
+        "observed_at": observed_at,
+        "activity_marker": "fixture",
+        "observation_source": "status_line",
+        "rate_limits": {
+            "five_hour": {"used_percentage": 10, "resets_at": 2000},
+            "seven_day": {"used_percentage": 20, "resets_at": 3000},
+        },
+    }), encoding="utf-8")
+
+
+def write_schema_two_cache(data_dir: Path, *, generated_at: int,
+                           credit_observed_at: int,
+                           credit_freshness: str) -> None:
+    claude = normalized_claude(credit_observed_at)
+    claude["credits"]["freshness"] = credit_freshness
+    codex = normalize_codex_result(codex_result(), observed_at=credit_observed_at)
+    (data_dir / "usage-cache.json").write_text(json.dumps({
+        "schema_version": 2,
+        "generated_at": generated_at,
+        "providers": {"claude": claude, "codex": codex},
+    }), encoding="utf-8")
 
 
 class CodexProtocolTests(unittest.TestCase):
@@ -145,26 +188,108 @@ class ClaudeSnapshotTests(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), before)
 
 
-class ProviderAuthenticationTests(unittest.TestCase):
-    def test_oauth_usage_rejection_requires_reauthentication(self) -> None:
-        class UsageRejected(RuntimeError):
-            response = SimpleNamespace(status_code=401)
+class ClaudeOAuthUsageTests(unittest.TestCase):
+    def payload(self) -> dict:
+        return {
+            "five_hour": {"utilization": 0.1, "resets_at": "2026-09-20T01:00:00Z"},
+            "seven_day": {"utilization": 0.2, "resets_at": "2026-09-25T01:00:00Z"},
+            "extra_usage": {
+                "is_enabled": True, "used_credits": 1840, "monthly_limit": 10000,
+                "currency": "USD", "decimal_places": 2,
+            },
+        }
 
-        error = UsageRejected("provider rejected credentials")
+    def test_one_oauth_request_returns_only_normalized_provider_state(self) -> None:
+        calls = []
 
-        with patch("agent.account_usage._fetch_anthropic_account_usage", side_effect=error):
-            with self.assertRaises(ClaudeAuthenticationRequired):
-                fetch_claude_rate_limits()
+        def request_json(url: str, headers: dict, timeout: float) -> dict:
+            calls.append((url, headers, timeout))
+            return self.payload()
 
-    def test_expired_stored_oauth_without_a_usage_response_requires_reauthentication(self) -> None:
+        provider = fetch_claude_rate_limits(
+            100,
+            token_resolver=lambda: "oauth-secret-token",
+            oauth_checker=lambda token: token == "oauth-secret-token",
+            request_json=request_json,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "https://api.anthropic.com/api/oauth/usage")
+        self.assertEqual(calls[0][2], 15.0)
+        self.assertEqual(calls[0][1]["Authorization"], "Bearer oauth-secret-token")
+        serialized = json.dumps(provider)
+        self.assertNotIn("oauth-secret-token", serialized)
+        self.assertNotIn("extra_usage", serialized)
+        self.assertEqual(provider["credits"]["spend"]["used_minor"], 1840)
+
+    def test_default_path_imports_the_installed_hermes_credential_resolver(self) -> None:
+        credentials = ModuleType("agent.anthropic_credentials")
+        setattr(credentials, "resolve_anthropic_token", lambda: "oauth-secret-token")
+        setattr(credentials, "_is_oauth_token", lambda _token: True)
         with (
-            patch("agent.account_usage._fetch_anthropic_account_usage", return_value=None),
-            patch("agent.anthropic_credentials.read_claude_code_credentials", return_value={"expiresAt": 1}),
-            patch("agent.anthropic_credentials.is_claude_code_token_valid", return_value=False),
+            patch.dict(sys.modules, {"agent.anthropic_credentials": credentials}),
+            patch("model_usage_status.service._claude_request_json",
+                  return_value=self.payload()),
         ):
-            with self.assertRaises(ClaudeAuthenticationRequired):
-                fetch_claude_rate_limits()
+            provider = fetch_claude_rate_limits(100)
+        self.assertEqual(provider["credits"]["status"], "current")
 
+    def test_401_403_429_and_timeout_use_safe_errors(self) -> None:
+        class ResponseError(RuntimeError):
+            def __init__(self, status_code: int) -> None:
+                super().__init__("provider body containing secret-value")
+                self.response = SimpleNamespace(status_code=status_code)
+
+        for error, expected in (
+            (ResponseError(401), ClaudeAuthenticationRequired),
+            (ResponseError(403), ClaudeAuthenticationRequired),
+            (ResponseError(429), ProviderUsageUnavailable),
+            (TimeoutError("secret-value"), ProviderUsageUnavailable),
+        ):
+            with self.subTest(error=type(error).__name__):
+                with self.assertRaises(expected) as raised:
+                    fetch_claude_rate_limits(
+                        100,
+                        token_resolver=lambda: "oauth-secret-token",
+                        oauth_checker=lambda _token: True,
+                        request_json=lambda *_args: (_ for _ in ()).throw(error),
+                    )
+                self.assertNotIn("secret-value", str(raised.exception))
+
+    def test_non_dict_response_body_is_malformed(self) -> None:
+        with self.assertRaises(ProviderUsageUnavailable) as raised:
+            fetch_claude_rate_limits(
+                100,
+                token_resolver=lambda: "oauth-secret-token",
+                oauth_checker=lambda _token: True,
+                request_json=lambda *_args: ["not", "a", "dict"],
+            )
+        self.assertEqual(raised.exception.credit_error_code, "malformed")
+
+    def test_missing_or_non_oauth_token_is_unsupported(self) -> None:
+        def must_not_request(*_args: object) -> dict:
+            self.fail("request_json must not be called without a usable token")
+
+        with self.assertRaises(ProviderUsageUnavailable) as raised:
+            fetch_claude_rate_limits(
+                100,
+                token_resolver=lambda: None,
+                oauth_checker=lambda _token: True,
+                request_json=must_not_request,
+            )
+        self.assertEqual(raised.exception.credit_error_code, "unsupported")
+
+        with self.assertRaises(ProviderUsageUnavailable) as raised:
+            fetch_claude_rate_limits(
+                100,
+                token_resolver=lambda: "sk-ant-api-not-oauth",
+                oauth_checker=lambda _token: False,
+                request_json=must_not_request,
+            )
+        self.assertEqual(raised.exception.credit_error_code, "unsupported")
+
+
+class ProviderAuthenticationTests(unittest.TestCase):
     def test_successful_status_is_authenticated_without_action(self) -> None:
         result = authentication_status(
             "claude",
@@ -241,7 +366,7 @@ class ProviderAuthenticationTests(unittest.TestCase):
 class UsageServiceTests(unittest.TestCase):
     def test_oauth_rejection_overrides_a_false_healthy_cli_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            def rejected() -> dict:
+            def rejected(_observed_at: int) -> dict:
                 raise ClaudeAuthenticationRequired("claude_authentication_required")
 
             service = UsageService(
@@ -272,16 +397,24 @@ class UsageServiceTests(unittest.TestCase):
 
     def test_refresh_uses_live_claude_usage_without_status_line_observation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            service = UsageService(
-                Path(directory),
-                codex_fetcher=lambda: codex_result(),
-                claude_fetcher=lambda: {
-                    "observation_source": "usage",
-                    "rate_limits": {
-                        "five_hour": {"used_percentage": 0, "resets_at": 2000},
-                        "seven_day": {"used_percentage": 100, "resets_at": 3000},
+            data_dir = Path(directory)
+
+            def claude_fetcher(observed_at: int) -> dict:
+                return fetch_claude_rate_limits(
+                    observed_at,
+                    token_resolver=lambda: "oauth-secret-token",
+                    oauth_checker=lambda token: token == "oauth-secret-token",
+                    request_json=lambda *_args: {
+                        "five_hour": {"utilization": 0.0, "resets_at": "2026-09-20T01:00:00Z"},
+                        "seven_day": {"utilization": 1.0, "resets_at": "2026-09-25T01:00:00Z"},
+                        "extra_usage": None,
                     },
-                },
+                )
+
+            service = UsageService(
+                data_dir,
+                codex_fetcher=lambda: codex_result(),
+                claude_fetcher=claude_fetcher,
                 now=lambda: 1000,
                 auth_checker=authenticated,
             )
@@ -290,11 +423,20 @@ class UsageServiceTests(unittest.TestCase):
 
             claude = snapshot["providers"]["claude"]
             self.assertEqual(claude["status"], "current")
-            self.assertEqual(claude["source"], "Claude Code /usage")
+            self.assertEqual(claude["source"], "claude-oauth-usage")
             self.assertEqual(
                 [window["remaining_percent"] for window in claude["windows"]],
                 [100.0, 0.0],
             )
+            credits = claude["credits"]
+            self.assertEqual(credits["status"], "unavailable")
+            self.assertIsNone(credits["observed_at"])
+            self.assertIsNone(credits["source"])
+
+            cache_text = (data_dir / "usage-cache.json").read_text(encoding="utf-8")
+            self.assertNotIn("oauth-secret-token", cache_text)
+            self.assertNotIn("Authorization", cache_text)
+            self.assertNotIn("extra_usage", cache_text)
 
     def test_refresh_combines_codex_with_current_claude_observation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -405,6 +547,531 @@ class UsageServiceTests(unittest.TestCase):
 
             self.assertEqual(calls, 1)
             self.assertEqual(len(results), 2)
+
+
+def _capture_error(callable_, errors: list[Exception]) -> None:
+    try:
+        callable_()
+    except Exception as error:
+        errors.append(error)
+
+
+class _SequencedClock:
+    """A thread-safe fake monotonic clock that serves a fixed sequence of
+    values under a lock, then repeats its last value indefinitely instead of
+    raising StopIteration inside a worker thread. Tests that care about the
+    exact number of samples should assert on ``call_count`` explicitly."""
+
+    def __init__(self, *values: float) -> None:
+        self._values = list(values)
+        self._lock = threading.Lock()
+        self._next_index = 0
+
+    def __call__(self) -> float:
+        with self._lock:
+            index = min(self._next_index, len(self._values) - 1)
+            self._next_index += 1
+            return self._values[index]
+
+    @property
+    def call_count(self) -> int:
+        with self._lock:
+            return self._next_index
+
+
+class RefreshOwnershipTests(unittest.TestCase):
+    def test_newer_manual_requests_coalesce_into_one_follow_up(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            calls = 0
+            first_started = threading.Event()
+            release_first = threading.Event()
+            followup_started = threading.Event()
+            release_followup = threading.Event()
+            clock = _SequencedClock(10.0, 20.0, 21.0, 30.0)
+
+            def codex_fetcher() -> dict:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    first_started.set()
+                    release_first.wait(timeout=2)
+                elif calls == 2:
+                    followup_started.set()
+                    release_followup.wait(timeout=2)
+                return codex_result(used=50 - calls)
+
+            service = UsageService(
+                Path(directory), codex_fetcher=codex_fetcher,
+                claude_fetcher=lambda observed_at: normalized_claude(observed_at),
+                now=lambda: 1000, monotonic=clock,
+                auth_checker=authenticated,
+            )
+            results = []
+            owner = threading.Thread(target=lambda: results.append(service.refresh()))
+            owner.start()
+            self.assertTrue(first_started.wait(timeout=1))
+            waiter_count = 0
+            waiter_count_lock = threading.Lock()
+            both_waiting = threading.Event()
+            original_wait = service._refresh_done.wait
+
+            def observed_wait(timeout=None):
+                nonlocal waiter_count
+                with waiter_count_lock:
+                    waiter_count += 1
+                    if waiter_count == 2:
+                        both_waiting.set()
+                return original_wait(timeout)
+
+            manual_a = threading.Thread(target=lambda: results.append(service.refresh(manual=True)))
+            manual_b = threading.Thread(target=lambda: results.append(service.refresh(manual=True)))
+            with patch.object(service._refresh_done, "wait", side_effect=observed_wait):
+                manual_a.start()
+                manual_b.start()
+                self.assertTrue(both_waiting.wait(timeout=1))
+            release_first.set()
+            self.assertTrue(followup_started.wait(timeout=1))
+            release_followup.set()
+            for thread in (owner, manual_a, manual_b):
+                thread.join(timeout=2)
+
+            self.assertEqual(calls, 2)
+            self.assertEqual(len(results), 3)
+            self.assertTrue(all(result["generated_at"] == 1000 for result in results))
+            self.assertEqual(
+                clock.call_count, 4,
+                "expected exactly 4 monotonic() samples: owner start, the two "
+                "manual requests, and one coalesced follow-up owner restart",
+            )
+
+    def test_manual_request_with_equal_timestamp_accepts_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            gate = threading.Event()
+            started = threading.Event()
+            calls = 0
+
+            def fetcher() -> dict:
+                nonlocal calls
+                calls += 1
+                started.set()
+                gate.wait(timeout=2)
+                return codex_result()
+
+            service = UsageService(
+                Path(directory), codex_fetcher=fetcher,
+                claude_fetcher=lambda observed_at: normalized_claude(observed_at),
+                now=lambda: 1000, monotonic=lambda: 10.0,
+                auth_checker=authenticated,
+            )
+            owner = threading.Thread(target=service.refresh)
+            manual = threading.Thread(target=lambda: service.refresh(manual=True))
+            owner.start()
+            self.assertTrue(started.wait(timeout=1))
+            waiting = threading.Event()
+            original_wait = service._refresh_done.wait
+
+            def observed_wait(timeout=None):
+                waiting.set()
+                return original_wait(timeout)
+
+            with patch.object(service._refresh_done, "wait", side_effect=observed_wait):
+                manual.start()
+                self.assertTrue(waiting.wait(timeout=1))
+            gate.set()
+            owner.join(timeout=2)
+            manual.join(timeout=2)
+            self.assertEqual(calls, 1)
+
+    def test_unexpected_owner_failure_releases_waiters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = UsageService(
+                Path(directory), now=lambda: 1000, monotonic=lambda: 10.0,
+                auth_checker=authenticated,
+            )
+            started = threading.Event()
+            release = threading.Event()
+            waiting = threading.Event()
+
+            def fail_once() -> dict:
+                started.set()
+                release.wait(timeout=2)
+                raise RuntimeError("synthetic failure")
+
+            service._refresh_once = fail_once
+            owner_errors: list[Exception] = []
+            waiter_errors: list[Exception] = []
+            owner = threading.Thread(target=lambda: _capture_error(service.refresh, owner_errors))
+            owner.start()
+            self.assertTrue(started.wait(timeout=1))
+
+            # Wrap the owner's in-flight event so we can observe the waiter actually
+            # parking on done.wait() before releasing the owner: the same
+            # deterministic barrier pattern used by the aging/coalescing tests,
+            # not a timing-only sleep.
+            owner_event = service._refresh_done
+            original_wait = owner_event.wait
+
+            def observed_wait(timeout: float | None = None) -> bool:
+                waiting.set()
+                return original_wait(timeout)
+
+            owner_event.wait = observed_wait
+
+            waiter = threading.Thread(target=lambda: _capture_error(service.refresh, waiter_errors))
+            waiter.start()
+            self.assertTrue(waiting.wait(timeout=1))
+
+            release.set()
+            owner.join(timeout=2)
+            waiter.join(timeout=2)
+
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(len(owner_errors), 1)
+            self.assertEqual(waiter_errors, [])
+
+    def test_stale_owner_token_cannot_deregister_a_new_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = UsageService(Path(directory), auth_checker=authenticated)
+            stale_done = threading.Event()
+            newer_done = threading.Event()
+            with service._state_lock:
+                service._refreshing = True
+                service._owner_started_at = 20.0
+                service._refresh_done = newer_done
+                released = service._finish_owner_locked(stale_done)
+            self.assertFalse(released)
+            self.assertTrue(service._refreshing)
+            self.assertEqual(service._owner_started_at, 20.0)
+            self.assertIs(service._refresh_done, newer_done)
+
+
+class CacheAdmissionTests(unittest.TestCase):
+    def valid_snapshot(self) -> dict:
+        return {
+            "schema_version": 2,
+            "generated_at": 100,
+            "providers": {
+                "claude": normalized_claude(100),
+                "codex": normalize_codex_result(codex_result(), observed_at=100),
+            },
+        }
+
+    def _read_cache_for(self, snapshot: dict):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            (data_dir / "usage-cache.json").write_text(json.dumps(snapshot), encoding="utf-8")
+            codex_calls: list[None] = []
+            claude_calls: list[int] = []
+            service = UsageService(
+                data_dir,
+                codex_fetcher=lambda: codex_calls.append(None) or codex_result(),
+                claude_fetcher=lambda observed_at: claude_calls.append(observed_at) or normalized_claude(observed_at),
+                now=lambda: 100,
+                auth_checker=authenticated,
+            )
+            result = service._read_cache()
+            self.assertEqual(codex_calls, [])
+            self.assertEqual(claude_calls, [])
+            return result
+
+    def test_valid_schema_v2_snapshot_is_admitted(self) -> None:
+        self.assertIsNotNone(self._read_cache_for(self.valid_snapshot()))
+
+    def test_provider_id_mismatch_or_wrong_type_is_rejected(self) -> None:
+        for bad_id in (["claude"], {"id": "claude"}, "codex", None):
+            with self.subTest(bad_id=bad_id):
+                snapshot = self.valid_snapshot()
+                snapshot["providers"]["claude"]["id"] = bad_id
+                self.assertIsNone(self._read_cache_for(snapshot))
+
+    def test_provider_credits_not_a_dict_is_rejected(self) -> None:
+        for bad_credits in (None, "current", ["current"], 42):
+            with self.subTest(bad_credits=bad_credits):
+                snapshot = self.valid_snapshot()
+                snapshot["providers"]["codex"]["credits"] = bad_credits
+                self.assertIsNone(self._read_cache_for(snapshot))
+
+    def test_credit_unit_unhashable_or_non_canonical_is_rejected(self) -> None:
+        for provider_id, bad_unit in (
+            ("claude", "credits"), ("codex", "currency"), ("codex", ["credits"]),
+        ):
+            with self.subTest(provider_id=provider_id, bad_unit=bad_unit):
+                snapshot = self.valid_snapshot()
+                snapshot["providers"][provider_id]["credits"]["unit"] = bad_unit
+                self.assertIsNone(self._read_cache_for(snapshot))
+
+    def test_credit_block_missing_required_key_is_rejected(self) -> None:
+        for missing_key in ("status", "observed_at", "error_code", "unit", "freshness"):
+            with self.subTest(missing_key=missing_key):
+                snapshot = self.valid_snapshot()
+                del snapshot["providers"]["claude"]["credits"][missing_key]
+                self.assertIsNone(self._read_cache_for(snapshot))
+
+    def test_provider_container_not_a_dict_is_rejected(self) -> None:
+        for bad_provider in (["claude"], "claude", 1, None):
+            with self.subTest(bad_provider=bad_provider):
+                snapshot = self.valid_snapshot()
+                snapshot["providers"]["claude"] = bad_provider
+                self.assertIsNone(self._read_cache_for(snapshot))
+
+    def test_invalid_cache_forces_get_to_refresh_with_canonical_unavailable_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            snapshot = self.valid_snapshot()
+            snapshot["providers"]["claude"]["id"] = ["claude"]
+            (data_dir / "usage-cache.json").write_text(json.dumps(snapshot), encoding="utf-8")
+            calls = []
+            service = UsageService(
+                data_dir,
+                codex_fetcher=lambda: calls.append("codex") or codex_result(),
+                claude_fetcher=lambda _observed_at: (_ for _ in ()).throw(
+                    ProviderUsageUnavailable("provider_unavailable")
+                ),
+                now=lambda: 200,
+                auth_checker=authenticated,
+            )
+
+            result = service.get()
+
+            self.assertEqual(calls, ["codex"])
+            self.assertEqual(result["providers"]["claude"]["status"], "unavailable")
+            self.assertIsNone(result["providers"]["claude"]["observed_at"])
+            self.assertEqual(result["schema_version"], 2)
+
+
+class CreditServiceTests(unittest.TestCase):
+    def test_legacy_cache_forces_refresh_and_schema_two_is_written(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            (data_dir / "usage-cache.json").write_text(json.dumps({
+                "schema_version": 1, "generated_at": 999,
+                "providers": {},
+            }), encoding="utf-8")
+            calls = []
+            service = UsageService(
+                data_dir,
+                codex_fetcher=lambda: calls.append("codex") or codex_result(),
+                claude_fetcher=lambda observed_at: normalized_claude(observed_at),
+                now=lambda: 1000,
+                auth_checker=authenticated,
+            )
+
+            result = service.get()
+
+            self.assertEqual(calls, ["codex"])
+            self.assertEqual(result["schema_version"], 2)
+            self.assertEqual(json.loads((data_dir / "usage-cache.json").read_text())["schema_version"], 2)
+
+    def test_passive_allowance_fallback_cannot_refresh_credits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            now = [100]
+            service = UsageService(
+                data_dir,
+                codex_fetcher=lambda: codex_result(),
+                claude_fetcher=lambda observed_at: normalized_claude(observed_at),
+                now=lambda: now[0],
+                auth_checker=authenticated,
+            )
+            service.refresh()
+            now[0] = 200
+            service.claude_fetcher = lambda _observed_at: (_ for _ in ()).throw(
+                ProviderUsageUnavailable("timeout")
+            )
+            write_passive_observation(data_dir, observed_at=200)
+
+            second = service.refresh()
+
+            self.assertEqual(second["providers"]["claude"]["windows"][0]["remaining_percent"], 90.0)
+            self.assertEqual(second["providers"]["claude"]["credits"]["freshness"], "stale")
+            self.assertEqual(second["providers"]["claude"]["credits"]["observed_at"], 100)
+
+    def test_claude_credits_recover_to_current_after_live_read_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            now = [100]
+            service = UsageService(
+                data_dir,
+                codex_fetcher=lambda: codex_result(),
+                claude_fetcher=lambda observed_at: normalized_claude(observed_at),
+                now=lambda: now[0],
+                auth_checker=authenticated,
+            )
+            service.refresh()
+
+            now[0] = 200
+            service.claude_fetcher = lambda _observed_at: (_ for _ in ()).throw(
+                ProviderUsageUnavailable("timeout")
+            )
+            write_passive_observation(data_dir, observed_at=200)
+            bounded_stale = service.refresh()
+            self.assertEqual(bounded_stale["providers"]["claude"]["credits"]["freshness"], "stale")
+            self.assertEqual(bounded_stale["providers"]["claude"]["credits"]["observed_at"], 100)
+
+            now[0] = 300
+            service.claude_fetcher = lambda observed_at: normalized_claude(observed_at)
+            recovered = service.refresh()
+
+            credits = recovered["providers"]["claude"]["credits"]
+            self.assertEqual(credits["status"], "current")
+            self.assertEqual(credits["freshness"], "current")
+            self.assertEqual(credits["observed_at"], 300)
+
+    def test_stale_credit_expires_on_cached_read_without_waiting_for_cache_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            write_schema_two_cache(data_dir, generated_at=995, credit_observed_at=99,
+                                    credit_freshness="stale")
+            codex_calls: list[None] = []
+            claude_calls: list[int] = []
+            service = UsageService(
+                data_dir,
+                codex_fetcher=lambda: codex_calls.append(None) or codex_result(),
+                claude_fetcher=lambda observed_at: claude_calls.append(observed_at) or normalized_claude(observed_at),
+                now=lambda: 1000,
+                auth_checker=authenticated,
+            )
+
+            credits = service.get()["providers"]["claude"]["credits"]
+
+            self.assertEqual(credits["status"], "unavailable")
+            self.assertIsNone(credits["observed_at"])
+            self.assertIsNone(credits["source"])
+            self.assertEqual(codex_calls, [])
+            self.assertEqual(claude_calls, [])
+
+    def test_concurrent_refresh_owner_generated_at_survives_aging_race(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            write_schema_two_cache(data_dir, generated_at=750, credit_observed_at=1,
+                                    credit_freshness="current")
+            gate = threading.Event()
+            started = threading.Event()
+
+            def slow_codex_fetcher() -> dict:
+                started.set()
+                gate.wait(timeout=2)
+                return codex_result()
+
+            service = UsageService(
+                data_dir,
+                codex_fetcher=slow_codex_fetcher,
+                claude_fetcher=lambda observed_at: normalized_claude(observed_at),
+                now=lambda: 1000,
+                auth_checker=authenticated,
+            )
+
+            owner_result: dict = {}
+            owner_thread = threading.Thread(
+                target=lambda: owner_result.update(snapshot=service.refresh())
+            )
+            owner_thread.start()
+            self.assertTrue(started.wait(timeout=1))
+
+            reader_view = service.get()
+
+            gate.set()
+            owner_thread.join(timeout=2)
+
+            self.assertEqual(owner_result["snapshot"]["generated_at"], 1000)
+            on_disk = json.loads((data_dir / "usage-cache.json").read_text())
+            self.assertEqual(on_disk["generated_at"], 1000)
+            self.assertEqual(reader_view["providers"]["claude"]["credits"]["status"], "unavailable")
+
+    def test_waiter_ages_credits_past_900_seconds_after_owner_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            gate = threading.Event()
+            started = threading.Event()
+            waiting = threading.Event()
+            now_box = [100]
+
+            def slow_codex_fetcher() -> dict:
+                started.set()
+                gate.wait(timeout=2)
+                return codex_result()
+
+            service = UsageService(
+                data_dir,
+                codex_fetcher=slow_codex_fetcher,
+                claude_fetcher=lambda observed_at: normalized_claude(observed_at),
+                now=lambda: now_box[0],
+                auth_checker=authenticated,
+            )
+
+            owner_thread = threading.Thread(target=service.refresh)
+            owner_thread.start()
+            self.assertTrue(started.wait(timeout=1))
+
+            # Wrap the owner's in-flight event so we can observe the waiter actually
+            # parking inside done.wait() before releasing the owner: a deterministic
+            # barrier instead of a timing-only sleep between thread starts.
+            owner_event = service._refresh_done
+            original_wait = owner_event.wait
+
+            def observed_wait(timeout: float | None = None) -> bool:
+                waiting.set()
+                return original_wait(timeout)
+
+            owner_event.wait = observed_wait
+
+            # Simulate wall-clock time passing while the waiter is parked in done.wait():
+            # the owner captured now=100 before it ever blocked, but by the time the
+            # waiter is released it must judge freshness using its own current clock.
+            now_box[0] = 1100
+
+            waiter_result: dict = {}
+            waiter_thread = threading.Thread(
+                target=lambda: waiter_result.update(snapshot=service.refresh())
+            )
+            waiter_thread.start()
+            self.assertTrue(waiting.wait(timeout=1))
+
+            gate.set()
+            owner_thread.join(timeout=2)
+            waiter_thread.join(timeout=2)
+
+            credits = waiter_result["snapshot"]["providers"]["claude"]["credits"]
+            self.assertEqual(credits["status"], "unavailable")
+            self.assertIsNone(credits["observed_at"])
+            self.assertIsNone(credits["source"])
+
+    def test_waiter_wait_budget_covers_two_full_provider_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            codex_calls: list[None] = []
+            claude_calls: list[int] = []
+            service = UsageService(
+                data_dir,
+                codex_fetcher=lambda: codex_calls.append(None) or codex_result(),
+                claude_fetcher=lambda observed_at: claude_calls.append(observed_at) or normalized_claude(observed_at),
+                now=lambda: 100,
+                auth_checker=authenticated,
+            )
+            service._refreshing = True
+            fresh_event = threading.Event()
+            captured: dict = {}
+
+            def capturing_wait(timeout: float | None = None) -> bool:
+                captured["timeout"] = timeout
+                return True
+
+            fresh_event.wait = capturing_wait
+            service._refresh_done = fresh_event
+
+            service.refresh()
+
+            # A waiter may need to outlast the owner's initial pass plus one
+            # REQ-FLOW-1 coalesced follow-up pass, so the budget must cover two
+            # full Codex+Claude passes, not just one.
+            self.assertGreaterEqual(REFRESH_WAIT_TIMEOUT_SECONDS, 90)
+            self.assertEqual(
+                REFRESH_WAIT_TIMEOUT_SECONDS,
+                2 * (CODEX_TIMEOUT_SECONDS + CLAUDE_TIMEOUT_SECONDS + 5) + 10,
+            )
+            self.assertEqual(captured["timeout"], REFRESH_WAIT_TIMEOUT_SECONDS)
+            self.assertEqual(codex_calls, [])
+            self.assertEqual(claude_calls, [])
 
 
 if __name__ == "__main__":

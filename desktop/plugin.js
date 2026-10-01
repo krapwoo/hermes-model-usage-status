@@ -9,7 +9,7 @@ import {
 import { useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
-const DATA_CONTRACT_VERSION = 3
+const DATA_CONTRACT_VERSION = 4
 const QUERY_KEY = ['model-usage-status', DATA_CONTRACT_VERSION]
 let rest = null
 
@@ -21,7 +21,12 @@ function bindRest(value) {
 }
 
 function call(path, options) {
-  return rest ? rest(path, options) : Promise.reject(new Error('model usage API unavailable'))
+  // Usage is local machine/account state, not per-profile or per-connection
+  // data — every call must read the local backend's primary state regardless
+  // of which Hermes profile or remote connection the desktop window is on.
+  return rest
+    ? rest(path, { ...options, target: 'local-primary' })
+    : Promise.reject(new Error('model usage API unavailable'))
 }
 
 function useUsage() {
@@ -33,19 +38,202 @@ function useUsage() {
   })
 }
 
+// A failed refresh must keep whatever safe query data is already cached and
+// must never let its rejection reach the caller unhandled, so the request and
+// its outcome are isolated here: apply the result only on success, and always
+// resolve.
+async function refreshUsage(requestRefresh) {
+  try {
+    const next = await requestRefresh()
+    queryClient.setQueryData(QUERY_KEY, next)
+    return { ok: true }
+  } catch (_error) {
+    return { ok: false }
+  }
+}
+
 function percent(value) {
   return Number.isFinite(value) ? `${Math.round(value)}%` : '—'
 }
 
-function compactLabel(providerId, provider) {
+function formatCurrencyMinor(amountMinor, currency, scale, locale) {
+  if (!Number.isSafeInteger(amountMinor) || amountMinor < 0 ||
+      !/^[A-Z]{3}$/.test(currency || '') || !Number.isInteger(scale) || scale < 0 || scale > 6) {
+    return null
+  }
+  const divisor = 10 ** scale
+  const fractionDigits = amountMinor % divisor === 0 ? 0 : scale
+  return new Intl.NumberFormat(locale ? [locale] : [], {
+    style: 'currency', currency,
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: fractionDigits
+  }).format(amountMinor / divisor)
+}
+
+function formatWholeCredits(amountCredits, locale) {
+  const numeric = Number(amountCredits)
+  if (!Number.isFinite(numeric) || numeric < 0) return null
+  return new Intl.NumberFormat(locale ? [locale] : [], { maximumFractionDigits: 0 }).format(numeric)
+}
+
+function selectCompactAllowance(windows) {
+  const valid = (Array.isArray(windows) ? windows : []).filter(
+    window => Number.isFinite(window?.remaining_percent)
+  )
+  const weekly = valid.find(window => window.duration_minutes === 10080)
+  const short = valid.find(window => window.duration_minutes === 300)
+  if (weekly?.remaining_percent === 0) return weekly
+  if (short?.remaining_percent === 0) return short
+  if (weekly && short) return weekly.remaining_percent <= short.remaining_percent ? weekly : short
+  if (weekly) return weekly
+  if (short) return short
+  // Neither preferred duration is present (arbitrary or null durations only):
+  // fall back to whichever valid window has the lowest remaining percentage.
+  return valid.reduce(
+    (lowest, window) => (!lowest || window.remaining_percent < lowest.remaining_percent ? window : lowest),
+    null
+  )
+}
+
+function creditIsConsequential(credits) {
+  return credits?.status === 'current' &&
+    Boolean(credits.active || credits.low || credits.exhausted)
+}
+
+const UNAVAILABLE_CREDIT_PRESENTATION = {
+  primary: 'Unavailable', supporting: null, monthly: null, compact: null, consequential: false
+}
+const CLAUDE_OFF_SUPPORT = 'Paid extra usage is not enabled.'
+const CODEX_OFF_SUPPORT = 'Credit-backed usage is not available'
+const CODEX_HIDDEN_BALANCE_SUPPORT = 'The provider did not return a balance'
+
+function creditPresentation(providerId, credits, locale) {
+  if (!credits || typeof credits !== 'object') return UNAVAILABLE_CREDIT_PRESENTATION
+  const stale = credits.freshness === 'stale'
+
+  if (credits.status === 'off') {
+    return {
+      primary: stale ? 'Off · stale' : 'Off',
+      supporting: providerId === 'claude' ? CLAUDE_OFF_SUPPORT : CODEX_OFF_SUPPORT,
+      monthly: null, compact: null, consequential: false
+    }
+  }
+  if (credits.status !== 'current') return UNAVAILABLE_CREDIT_PRESENTATION
+
+  const consequential = creditIsConsequential(credits)
+
+  if (credits.unit === 'currency') {
+    const { currency, minor_unit_scale: scale, spend } = credits
+    if (!spend || !Number.isSafeInteger(spend.used_minor) || !Number.isSafeInteger(spend.limit_minor)) {
+      return UNAVAILABLE_CREDIT_PRESENTATION
+    }
+    const remainingMinor = Math.max(spend.limit_minor - spend.used_minor, 0)
+    const used = formatCurrencyMinor(spend.used_minor, currency, scale, locale)
+    const limit = formatCurrencyMinor(spend.limit_minor, currency, scale, locale)
+    const remaining = formatCurrencyMinor(remainingMinor, currency, scale, locale)
+    if (used === null || limit === null || remaining === null) return UNAVAILABLE_CREDIT_PRESENTATION
+
+    const qualifier = credits.exhausted ? 'Exhausted' : credits.low ? 'Low' : null
+    const primaryBase = `${used} of ${limit} used`
+    const primaryText = qualifier ? `${primaryBase} · ${qualifier}` : primaryBase
+    const compactBase = `Credits ${used}/${limit}`
+    const compact = qualifier ? `${compactBase} · ${qualifier}` : compactBase
+
+    return {
+      primary: stale ? `${primaryText} · stale` : primaryText,
+      supporting: `${remaining} remains this month`,
+      monthly: null,
+      compact,
+      consequential
+    }
+  }
+
+  if (credits.unit === 'credits') {
+    const { balance, spend } = credits
+    let base = null
+    let supporting = null
+    if (balance && balance.unlimited) {
+      base = 'Unlimited'
+    } else if (balance && balance.amount_credits != null) {
+      const numericAmount = Number(balance.amount_credits)
+      if (Number.isFinite(numericAmount) && numericAmount > 0 && numericAmount < 1) {
+        base = 'Less than 1 credit left'
+      } else {
+        const whole = formatWholeCredits(balance.amount_credits, locale)
+        base = whole !== null ? `${whole} credits left` : null
+      }
+    } else if (balance && balance.available) {
+      base = 'Available'
+      supporting = CODEX_HIDDEN_BALANCE_SUPPORT
+    }
+
+    // A numeric zero balance is independently exhausted; the monthly-limit wording
+    // is reserved for when the qualifier actually derives from `spend` while a
+    // nonzero/hidden/unlimited balance is shown, or when no balance exists at all.
+    const isZeroBalance = Boolean(balance) && balance.amount_credits != null &&
+      Number(balance.amount_credits) === 0
+    const monthlyQualified = isZeroBalance ? false : (!base || Boolean(spend))
+    const qualifier = credits.exhausted
+      ? (monthlyQualified ? 'Monthly limit reached' : 'Exhausted')
+      : credits.low
+        ? (monthlyQualified ? 'Monthly limit low' : 'Low')
+        : null
+
+    let text
+    if (base && qualifier) {
+      text = `${base} · ${qualifier}`
+    } else if (base) {
+      text = base
+    } else if (qualifier) {
+      text = qualifier
+    } else {
+      return UNAVAILABLE_CREDIT_PRESENTATION
+    }
+
+    // The monthly row always truthfully reports the spend object's own state,
+    // independent of which wording the primary/compact qualifier used above.
+    const monthly = spend ? {
+      used: spend.used_credits,
+      limit: spend.limit_credits,
+      remainingPercent: spend.remaining_percent,
+      resetsAt: spend.resets_at,
+      reached: Number.isFinite(spend.remaining_percent) && spend.remaining_percent <= 0
+    } : null
+
+    return {
+      primary: stale ? `${text} · stale` : text,
+      supporting,
+      monthly,
+      compact: text,
+      consequential
+    }
+  }
+
+  return UNAVAILABLE_CREDIT_PRESENTATION
+}
+
+function compactLabel(providerId, provider, locale) {
   const name = providerId === 'claude' ? 'Claude' : 'Codex'
   const windows = Array.isArray(provider?.windows) ? provider.windows : []
-  if (!windows.length) {
-    return `${name} —`
+  const credits = provider?.credits
+  const presentation = creditPresentation(providerId, credits, locale)
+
+  if (!presentation.consequential || !presentation.compact) {
+    if (!windows.length) {
+      return `${name} —`
+    }
+    const values = windows.map(window => `${window.label} ${percent(window.remaining_percent)}`).join(' · ')
+    const stale = provider.status === 'stale' || provider.status === 'expired' ? ' · stale' : ''
+    return `${name} ${values}${stale}`
   }
-  const values = windows.map(window => `${window.label} ${percent(window.remaining_percent)}`).join(' · ')
-  const stale = provider.status === 'stale' || provider.status === 'expired' ? ' · stale' : ''
-  return `${name} ${values}${stale}`
+
+  const allowance = selectCompactAllowance(windows)
+  const allowanceFact = allowance ? `${allowance.label} ${percent(allowance.remaining_percent)}` : null
+  const parts = [allowanceFact, presentation.compact].filter(Boolean)
+  const stale = provider?.status === 'stale' || provider?.status === 'expired' || credits?.freshness === 'stale'
+    ? ' · stale'
+    : ''
+  return `${name} ${parts.join(' · ')}${stale}`
 }
 
 function dateTime(epoch) {
@@ -100,6 +288,68 @@ function WindowRow({ window }) {
         className: 'shrink-0 tabular-nums text-foreground',
         children: `${percent(window.remaining_percent)} left`
       })
+    ]
+  })
+}
+
+function CreditsSection({ providerId, credits }) {
+  const presentation = creditPresentation(providerId, credits)
+  const stale = credits?.freshness === 'stale'
+  const monthly = presentation.monthly
+  const monthlyFacts = []
+  if (monthly?.used != null && monthly?.limit != null) {
+    monthlyFacts.push(`${monthly.used}/${monthly.limit} credits`)
+  } else if (monthly?.used != null) {
+    monthlyFacts.push(`${monthly.used} credits used`)
+  } else if (monthly?.limit != null) {
+    monthlyFacts.push(`${monthly.limit} credit limit`)
+  }
+  if (Number.isFinite(monthly?.remainingPercent)) {
+    monthlyFacts.push(`${percent(monthly.remainingPercent)} remaining`)
+  }
+  if (monthly?.reached) monthlyFacts.push('Reached')
+
+  return jsxs('div', {
+    className: 'border-t border-(--ui-stroke-secondary) pt-2',
+    children: [
+      jsx('div', { className: 'pb-1 font-medium text-(--ui-text-secondary)', children: 'Credits' }),
+      jsxs('div', {
+        className: 'space-y-2',
+        children: [
+          jsx('div', { className: 'text-foreground', children: presentation.primary }),
+          presentation.supporting
+            ? jsx('div', {
+                className: 'text-[0.6875rem] text-(--ui-text-tertiary)',
+                children: presentation.supporting
+              })
+            : null,
+          stale
+            ? jsx('div', {
+                className: 'text-[0.6875rem] text-(--ui-text-tertiary)',
+                children: age(credits.observed_at)
+              })
+            : null
+        ]
+      }),
+      monthly
+        ? jsxs('div', {
+            className: 'border-t border-(--ui-stroke-secondary) pt-2',
+            children: [
+              jsx('div', {
+                className: 'pb-1 font-medium text-(--ui-text-secondary)',
+                children: 'Monthly credit limit'
+              }),
+              jsx('div', {
+                className: 'text-foreground',
+                children: monthlyFacts.length ? monthlyFacts.join(' · ') : 'Details unavailable'
+              }),
+              jsx('div', {
+                className: 'text-[0.6875rem] text-(--ui-text-tertiary)',
+                children: dateTime(monthly.resetsAt)
+              })
+            ]
+          })
+        : null
     ]
   })
 }
@@ -214,6 +464,7 @@ function ProviderDetails({
           ]
         }, model.id)
       ),
+      jsx(CreditsSection, { providerId, credits: provider?.credits }),
       provider?.source
         ? jsx('div', {
             className: 'border-t border-(--ui-stroke-secondary) pt-2 text-[0.625rem] text-(--ui-text-quaternary)',
@@ -242,8 +493,7 @@ function ProviderMenu({ providerId }) {
     if (refreshing) return
     setRefreshing(true)
     try {
-      const next = await call('/refresh', { method: 'POST' })
-      queryClient.setQueryData(QUERY_KEY, next)
+      await refreshUsage(() => call('/refresh', { method: 'POST' }))
     } finally {
       setRefreshing(false)
     }
@@ -317,3 +567,5 @@ export default {
     })
   }
 }
+
+export { CreditsSection, compactLabel, creditPresentation, formatCurrencyMinor, refreshUsage, selectCompactAllowance }

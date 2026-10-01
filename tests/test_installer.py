@@ -18,9 +18,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 class FakeRunner:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
+        self.envs: list[dict[str, str] | None] = []
 
-    def __call__(self, args, **_kwargs):
+    def __call__(self, args, **kwargs):
         self.calls.append([str(part) for part in args])
+        self.envs.append(kwargs.get("env"))
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
 
@@ -176,6 +178,70 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(settings_path.read_text(encoding="utf-8"), original)
             self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
             self.assertEqual(runner.calls, [])
+
+    def test_install_from_named_profile_home_targets_the_primary_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            primary_hermes_home = home / ".hermes"
+            profile_hermes_home = primary_hermes_home / "profiles" / "coder"
+            claude_dir = home / ".claude"
+            claude_dir.mkdir(parents=True)
+            runner = FakeRunner()
+
+            result = install(
+                source=REPO_ROOT,
+                hermes_home=profile_hermes_home,
+                claude_config_dir=claude_dir,
+                runner=runner,
+            )
+
+            target = (primary_hermes_home / "plugins" / "model-usage-status").resolve()
+            self.assertEqual(result["target"], str(target))
+            self.assertTrue((target / "plugin.yaml").is_file())
+            self.assertFalse((profile_hermes_home / "plugins").exists())
+            for env in runner.envs:
+                self.assertIsNotNone(env)
+                self.assertEqual(env["HERMES_HOME"], str(primary_hermes_home.resolve()))
+
+    def test_install_preserves_a_custom_nonstandard_hermes_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            custom_hermes_home = root / "custom-hermes-env"
+            claude_dir = root / ".claude"
+            runner = FakeRunner()
+
+            result = install(
+                source=REPO_ROOT,
+                hermes_home=custom_hermes_home,
+                claude_config_dir=claude_dir,
+                runner=runner,
+            )
+
+            target = (custom_hermes_home / "plugins" / "model-usage-status").resolve()
+            self.assertEqual(result["target"], str(target))
+            for env in runner.envs:
+                self.assertIsNotNone(env)
+                self.assertEqual(env["HERMES_HOME"], str(custom_hermes_home.resolve()))
+
+    def test_uninstall_from_named_profile_home_targets_the_primary_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            primary_hermes_home = home / ".hermes"
+            profile_hermes_home = primary_hermes_home / "profiles" / "coder"
+            claude_dir = home / ".claude"
+            claude_dir.mkdir(parents=True)
+            install(source=REPO_ROOT, hermes_home=primary_hermes_home, claude_config_dir=claude_dir, runner=FakeRunner())
+            runner = FakeRunner()
+
+            result = uninstall(hermes_home=profile_hermes_home, claude_config_dir=claude_dir, runner=runner)
+
+            self.assertEqual(result["status"], "uninstalled")
+            self.assertFalse((primary_hermes_home / "plugins" / "model-usage-status").exists())
+            for env in runner.envs:
+                self.assertIsNotNone(env)
+                self.assertEqual(env["HERMES_HOME"], str(primary_hermes_home.resolve()))
 
     def test_uninstall_removes_only_plugin_and_its_own_status_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
