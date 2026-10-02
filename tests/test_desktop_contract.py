@@ -83,6 +83,19 @@ class DesktopPluginContractTests(unittest.TestCase):
         self.assertIn("method: 'POST'", source)
         self.assertIn("queryClient.invalidateQueries({ queryKey: QUERY_KEY })", source)
 
+    def test_authentication_required_copy_is_provider_specific(self) -> None:
+        source = PLUGIN.read_text(encoding="utf-8")
+
+        # The authentication-required message must name whichever provider actually
+        # needs reauthentication (Claude or Codex), not be hard-coded to Claude.
+        self.assertNotIn("Claude rejected the saved authentication", source)
+        self.assertIn("function errorText(provider, name)", source)
+        self.assertIn("errorText(provider, name)", source)
+        self.assertIn(
+            "`${name} rejected the saved authentication. Sign in again to refresh usage.`",
+            source,
+        )
+
     def test_every_backend_call_is_pinned_to_the_local_primary_backend(self) -> None:
         source = PLUGIN.read_text(encoding="utf-8")
 

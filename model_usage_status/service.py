@@ -58,6 +58,10 @@ class ClaudeAuthenticationRequired(RuntimeError):
     pass
 
 
+class CodexAuthenticationRequired(RuntimeError):
+    pass
+
+
 class ProviderUsageUnavailable(RuntimeError):
     def __init__(self, credit_error_code: str) -> None:
         self.credit_error_code = credit_error_code
@@ -86,7 +90,7 @@ def _is_valid_schema_v2_cache(data: Any) -> bool:
 
 
 def _credit_error_code(error: Exception) -> str:
-    if isinstance(error, ClaudeAuthenticationRequired):
+    if isinstance(error, (ClaudeAuthenticationRequired, CodexAuthenticationRequired)):
         return "auth_rejected"
     if isinstance(error, ProviderUsageUnavailable):
         return error.credit_error_code
@@ -178,6 +182,15 @@ def launch_reauthentication(
     return {"provider": provider, "state": "login_started"}
 
 
+def _is_codex_authentication_rejection(error: Any) -> bool:
+    if not isinstance(error, dict) or error.get("code") != -32603:
+        return False
+    message = str(error.get("message") or "").lower()
+    if "401" not in message or "unauthorized" not in message:
+        return False
+    return "invalidat" in message or "sign in again" in message
+
+
 def parse_codex_response_lines(lines: Iterable[str]) -> dict[str, Any]:
     for line in lines:
         try:
@@ -187,6 +200,8 @@ def parse_codex_response_lines(lines: Iterable[str]) -> dict[str, Any]:
         if not isinstance(payload, dict) or payload.get("id") != 1:
             continue
         if "error" in payload:
+            if _is_codex_authentication_rejection(payload["error"]):
+                raise CodexAuthenticationRequired("codex_authentication_required")
             raise RuntimeError("codex_provider_error")
         result = payload.get("result")
         if isinstance(result, dict):
@@ -356,15 +371,14 @@ class UsageService:
         provider_id: str,
         provider: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if provider_id == "claude":
-            if provider is None:
-                cached = self._read_cache() or {}
-                providers = cached.get("providers")
-                providers = providers if isinstance(providers, dict) else {}
-                candidate = providers.get(provider_id)
-                provider = candidate if isinstance(candidate, dict) else None
-            if provider is not None and provider.get("error_code") == "authentication_required":
-                return {"state": "required", "action_available": True}
+        if provider is None:
+            cached = self._read_cache() or {}
+            providers = cached.get("providers")
+            providers = providers if isinstance(providers, dict) else {}
+            candidate = providers.get(provider_id)
+            provider = candidate if isinstance(candidate, dict) else None
+        if provider is not None and provider.get("error_code") == "authentication_required":
+            return {"state": "required", "action_available": True}
         return self.auth_checker(provider_id)
 
     def launch_reauthentication(self, provider: str) -> dict[str, str]:
@@ -497,6 +511,8 @@ class UsageService:
                 credit_error_code=_credit_error_code(error),
             )
             codex["id"] = "codex"
+            if isinstance(error, CodexAuthenticationRequired):
+                codex["error_code"] = "authentication_required"
 
         try:
             claude_fresh = self.claude_fetcher(now)
