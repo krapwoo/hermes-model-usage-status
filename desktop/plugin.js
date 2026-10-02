@@ -257,10 +257,10 @@ function age(epoch) {
   return `Observed ${Math.floor(seconds / 86400)}d ago`
 }
 
-function errorText(provider) {
+function errorText(provider, name) {
   if (provider?.status === 'current') return null
   const messages = {
-    authentication_required: 'Claude rejected the saved authentication. Sign in again to refresh usage.',
+    authentication_required: `${name} rejected the saved authentication. Sign in again to refresh usage.`,
     observation_stale: 'Claude has not supplied a newer structured observation yet.',
     observation_unavailable: 'Use Claude Code normally once to populate its provider-native meters.',
     provider_unavailable: 'The provider usage surface could not be refreshed.',
@@ -367,7 +367,7 @@ function ProviderDetails({
   const name = providerId === 'claude' ? 'Claude' : 'Codex'
   const windows = Array.isArray(provider?.windows) ? provider.windows : []
   const modelLimits = Array.isArray(provider?.model_limits) ? provider.model_limits : []
-  const issue = errorText(provider)
+  const issue = errorText(provider, name)
 
   return jsxs('div', {
     className: 'w-[20rem] space-y-3 p-3 text-xs',

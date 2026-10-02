@@ -21,6 +21,7 @@ from model_usage_status.service import (  # noqa: E402
     CODEX_TIMEOUT_SECONDS,
     REFRESH_WAIT_TIMEOUT_SECONDS,
     ClaudeAuthenticationRequired,
+    CodexAuthenticationRequired,
     ProviderUsageUnavailable,
     UsageService,
     authentication_status,
@@ -109,6 +110,70 @@ class CodexProtocolTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "codex_provider_error"):
             parse_codex_response_lines(lines)
+
+    def test_response_parser_classifies_invalidated_token_error_as_authentication_required(self) -> None:
+        # Codex app-server surfaces an invalidated/expired saved token as a 401-shaped
+        # JSON-RPC error. That must be classified distinctly from an ordinary provider
+        # error so UsageService can later offer Reauthenticate instead of a generic
+        # "unavailable" state, without ever leaking the provider's raw error body.
+        secret_marker = "sk-codex-secret-session-token-ABC123"
+        lines = [json.dumps({
+            "id": 1,
+            "error": {
+                "code": -32603,
+                "message": (
+                    "usage request failed: 401 Unauthorized: "
+                    '{"error":{"message":"Your authentication token '
+                    f'({secret_marker}) has been invalidated. Please sign in again."}}'
+                ),
+            },
+        })]
+
+        with self.assertRaises(RuntimeError) as raised:
+            parse_codex_response_lines(lines)
+
+        self.assertNotEqual(
+            str(raised.exception), "codex_provider_error",
+            "an invalidated-token/401 Codex app-server error must raise a dedicated "
+            "authentication-required classification, not the generic provider error",
+        )
+        self.assertNotIn(secret_marker, str(raised.exception))
+        self.assertNotIn("Unauthorized", str(raised.exception))
+
+    def test_response_parser_keeps_unrelated_internal_error_generic(self) -> None:
+        # A -32603 error that is not a 401/invalidated-token shape (e.g. an unrelated
+        # provider-side internal failure) must stay the generic safe classification
+        # and must never surface the Reauthenticate action.
+        lines = [json.dumps({
+            "id": 1,
+            "error": {
+                "code": -32603,
+                "message": "usage request failed: upstream provider internal error",
+            },
+        })]
+
+        with self.assertRaises(RuntimeError) as raised:
+            parse_codex_response_lines(lines)
+
+        self.assertNotIsInstance(raised.exception, CodexAuthenticationRequired)
+        self.assertEqual(str(raised.exception), "codex_provider_error")
+
+    def test_response_parser_keeps_unauthorized_without_invalidation_marker_generic(self) -> None:
+        # A 401 Unauthorized-shaped message without an invalidated-token or
+        # sign-in-again marker must not be classified as authentication required.
+        lines = [json.dumps({
+            "id": 1,
+            "error": {
+                "code": -32603,
+                "message": "usage request failed: 401 Unauthorized: synthetic-placeholder-reason",
+            },
+        })]
+
+        with self.assertRaises(RuntimeError) as raised:
+            parse_codex_response_lines(lines)
+
+        self.assertNotIsInstance(raised.exception, CodexAuthenticationRequired)
+        self.assertEqual(str(raised.exception), "codex_provider_error")
 
 
 class ClaudeSnapshotTests(unittest.TestCase):
@@ -392,6 +457,51 @@ class UsageServiceTests(unittest.TestCase):
                 status_checker = launcher.call_args.kwargs["status_checker"]
                 self.assertEqual(
                     status_checker("claude"),
+                    {"state": "required", "action_available": True},
+                )
+
+    def test_codex_authentication_rejection_overrides_a_false_healthy_cli_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            secret_marker = "codex-oauth-secret-session-9f3a"
+            auth_error_lines = [json.dumps({
+                "id": 1,
+                "error": {
+                    "code": -32603,
+                    "message": (
+                        "usage request failed: 401 Unauthorized: "
+                        '{"error":{"message":"Your authentication token '
+                        f'({secret_marker}) has been invalidated. Please sign in again."}}'
+                    ),
+                },
+            })]
+
+            def rejected_codex() -> dict:
+                return parse_codex_response_lines(auth_error_lines)
+
+            service = UsageService(
+                Path(directory),
+                codex_fetcher=rejected_codex,
+                claude_fetcher=lambda observed_at: normalized_claude(observed_at),
+                now=lambda: 1000,
+                auth_checker=authenticated,
+            )
+
+            snapshot = service.refresh()
+
+            codex = snapshot["providers"]["codex"]
+            self.assertEqual(codex["error_code"], "authentication_required")
+            self.assertEqual(
+                codex["authentication"],
+                {"state": "required", "action_available": True},
+            )
+            self.assertNotIn(secret_marker, json.dumps(snapshot))
+
+            with patch("model_usage_status.service.launch_reauthentication") as launcher:
+                launcher.return_value = {"provider": "codex", "state": "login_started"}
+                service.launch_reauthentication("codex")
+                status_checker = launcher.call_args.kwargs["status_checker"]
+                self.assertEqual(
+                    status_checker("codex"),
                     {"state": "required", "action_available": True},
                 )
 
